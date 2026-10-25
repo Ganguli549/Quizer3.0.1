@@ -1,0 +1,2632 @@
+package com.example.ui
+import com.example.data.resolveHeaders
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.ViewModel
+
+import androidx.lifecycle.viewModelScope
+import com.example.data.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.Json
+import com.example.ui.components.optCleanString
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+class MainViewModel(
+    val repository: QuizRepository,
+    val settingsManager: SettingsManager,
+    val soundHapticManager: SoundHapticManager
+) : ViewModel() {
+    private val _isAppReady = MutableStateFlow(false)
+    val isAppReady = _isAppReady.asStateFlow()
+    
+    private val _showBackupRestoreDialog = MutableStateFlow(false)
+    val showBackupRestoreDialog = _showBackupRestoreDialog.asStateFlow()
+
+    private val _showAiAssistant = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val showAiAssistant = _showAiAssistant.asStateFlow()
+
+    var targetAiMode: String? = null
+    fun triggerOpenAiAssistant(chatContextId: String? = null) {
+        targetAiMode = chatContextId
+        _showAiAssistant.value = true
+    }
+    fun clearOpenAiAssistant() {
+        _showAiAssistant.value = false
+    }
+
+    var targetEditQuestionId: Long? = null
+    var targetEditQuestionGlobalId: String? = null
+    fun setTargetEditQuestion(id: Long?, globalId: String?) {
+        targetEditQuestionId = id
+        targetEditQuestionGlobalId = globalId
+    }
+    fun clearTargetEditQuestion() {
+        targetEditQuestionId = null
+        targetEditQuestionGlobalId = null
+    }
+
+    private var activeChatContextId: String? = null
+    fun setChatVisible(chatContextId: String?, context: android.content.Context? = null) {
+        activeChatContextId = chatContextId
+        if (chatContextId == null && context != null) {
+            postActiveTaskNotifications(context)
+        }
+    }
+
+    private var syncJob: kotlinx.coroutines.Job? = null
+    private var isInitializing = false
+
+    fun syncBooks(context: android.content.Context) {
+        if (!_isAppReady.value || isInitializing || syncJob?.isActive == true) return
+        syncJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val hasPerms = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    android.os.Environment.isExternalStorageManager()
+                } else {
+                    androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                }
+                if (!hasPerms) return@launch
+                
+                com.example.data.DataParser.syncBooksFromDirectory(context, repository)
+                
+                val allBooks = repository.getAllBooksSync()
+                if (allBooks.isNotEmpty()) {
+                    val currentId = _currentBookId.value
+                    if (currentId.isEmpty() || allBooks.none { it.id == currentId }) {
+                        withContext(Dispatchers.Main) {
+                            val preferred = allBooks.find { it.id == settingsManager.lastSelectedBookId } ?: allBooks.first()
+                            selectBook(preferred.id)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun initializeApp(context: android.content.Context) {
+        if (_isAppReady.value || isInitializing) {
+            return
+        }
+        isInitializing = true
+        viewModelScope.launch {
+            val prefs = com.example.data.SecurePrefs.get(context)
+            val isFirstLaunch = prefs.getBoolean("is_first_launch", true)
+            
+            if (isFirstLaunch && com.example.data.BackupManager.hasBackup()) {
+                _showBackupRestoreDialog.value = true
+            } else {
+                finishInitialization(context)
+            }
+        }
+    }
+
+    private suspend fun finishInitialization(context: android.content.Context) {
+        try {
+            val startTime = System.currentTimeMillis()
+            com.example.data.DataParser.loadInitialData(context, repository)
+            val allBooks = repository.getAllBooksSync()
+            if (allBooks.isNotEmpty()) {
+                val preferred = allBooks.find { it.id == settingsManager.lastSelectedBookId } ?: allBooks.first()
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    selectBook(preferred.id)
+                }
+            }
+            val elapsedTime = System.currentTimeMillis() - startTime
+            val minSplashTime = 3000L
+            val remainingTime = minSplashTime - elapsedTime
+            if (remainingTime > 0) {
+                kotlinx.coroutines.delay(remainingTime)
+            }
+            val prefs = com.example.data.SecurePrefs.get(context)
+            prefs.edit().putBoolean("is_first_launch", false).apply()
+            _isAppReady.value = true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            _isAppReady.value = true
+        } finally {
+            isInitializing = false
+        }
+    }
+    
+    fun onRestoreBackupDecision(context: android.content.Context, restore: Boolean) {
+        _showBackupRestoreDialog.value = false
+        viewModelScope.launch {
+            if (restore) {
+                val success = withContext(Dispatchers.IO) {
+                    com.example.data.BackupManager.restoreBackup(context)
+                }
+                withContext(Dispatchers.Main) {
+                    if (success) {
+                        // Refresh in-memory StateFlows from the newly restored SettingsManager
+                        _themeState.value = settingsManager.appTheme
+                        _themeModeState.value = settingsManager.appThemeMode
+                        _isMatteModeState.value = settingsManager.isMatteMode
+                        _appIconState.value = settingsManager.appIcon
+                        _timerSoundEnabledState.value = settingsManager.timerSoundEnabled
+                        _clickSoundEnabledState.value = settingsManager.clickSoundEnabled
+                        _hapticFeedbackEnabledState.value = settingsManager.hapticFeedbackEnabled
+                        repository.notifyDatabaseReplaced()
+                        android.widget.Toast.makeText(context, "Backup restored!", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        android.widget.Toast.makeText(context, "Failed to restore backup", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                }
+            } else {
+                withContext(Dispatchers.IO) {
+                    com.example.data.BackupManager.clearBackup()
+                }
+            }
+            finishInitialization(context)
+        }
+    }
+    private var quizGenJob: kotlinx.coroutines.Job? = null
+    var pendingQuizGenerationTrigger = true
+    var isLearnMode by androidx.compose.runtime.mutableStateOf(false)
+    var isActiveQuizStandardSequence by androidx.compose.runtime.mutableStateOf(true)
+
+    /**
+     * Source tag for the active quiz session:
+     * - Persisted in Quiz History: "Quiz" (Home / Main Quiz), "Learn" (Learn Center), "Search" (Content Explorer).
+     * - Excluded from Quiz History: "Bookmarks", "Review", "Revision".
+     */
+    var activeQuizSourceTag by androidx.compose.runtime.mutableStateOf("Quiz")
+
+
+    var activeRetainedOptionIndices: Map<Long, List<Int>> = emptyMap()
+
+    private val _lastCompletedQuizResult = MutableStateFlow<QuizHistoryEntity?>(null)
+    val lastCompletedQuizResult = _lastCompletedQuizResult.asStateFlow()
+
+    var currentExamSettings: ExamSettings? = null
+    var currentLearnSettings: ExamSettings? = null
+
+    private val _chatHistory = MutableStateFlow<Map<String, List<com.example.data.ChatMessageEntity>>>(emptyMap())
+    val chatHistory = _chatHistory.asStateFlow()
+
+    private val _pendingUpdates = MutableStateFlow<Map<String, List<com.example.ui.components.PendingQuestionUpdate>>>(emptyMap())
+    val pendingUpdates = _pendingUpdates.asStateFlow()
+    
+    private val _devLogs = MutableStateFlow<List<String>>(emptyList())
+    val devLogs = _devLogs.asStateFlow()
+
+    private val _sessionAttachments = MutableStateFlow<Map<String, android.net.Uri>>(emptyMap())
+    val sessionAttachments = _sessionAttachments.asStateFlow()
+
+    fun setSessionAttachment(chatContextId: String, uri: android.net.Uri?) {
+        val current = _sessionAttachments.value.toMutableMap()
+        if (uri == null) {
+            current.remove(chatContextId)
+        } else {
+            current[chatContextId] = uri
+        }
+        _sessionAttachments.value = current
+    }
+    
+    fun clearDevLogs() {
+        _devLogs.value = emptyList()
+    }
+    
+    fun addDevLog(log: String) {
+        val timestamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+        _devLogs.value = _devLogs.value + "[$timestamp] $log"
+    }
+    
+    private val _aiProcessingStatus = MutableStateFlow<Map<String, String>>(emptyMap())
+    val aiProcessingStatus = _aiProcessingStatus.asStateFlow()
+
+    private val _aiProcessingProgress = MutableStateFlow<Map<String, Float>>(emptyMap())
+    val aiProcessingProgress = _aiProcessingProgress.asStateFlow()
+    
+    private val _aiPromptTexts = MutableStateFlow<Map<String, String>>(emptyMap())
+    val aiPromptTexts = _aiPromptTexts.asStateFlow()
+
+    fun setAiPromptText(chatContextId: String, text: String) {
+        val current = _aiPromptTexts.value.toMutableMap()
+        current[chatContextId] = text
+        _aiPromptTexts.value = current
+    }
+
+    private val aiProcessingJobs = mutableMapOf<String, kotlinx.coroutines.Job>()
+    
+    fun setAiProcessingStatus(chatContextId: String, status: String?, progress: Float = 0f) {
+        val current = _aiProcessingStatus.value.toMutableMap()
+        val currentProgress = _aiProcessingProgress.value.toMutableMap()
+        if (status == null) {
+            current.remove(chatContextId)
+            currentProgress.remove(chatContextId)
+        } else {
+            current[chatContextId] = status
+            currentProgress[chatContextId] = progress
+        }
+        _aiProcessingStatus.value = current
+        _aiProcessingProgress.value = currentProgress
+    }
+    
+    data class ActiveAiTask(
+        val chatContextId: String,
+        val notificationId: Int,
+        var title: String = "AI Assistant",
+        var status: String = "Analyzing request...",
+        val isExtraction: Boolean = true
+    )
+    private val activeAiTasks = java.util.concurrent.ConcurrentHashMap<String, ActiveAiTask>()
+    private var isAppInForeground: Boolean = true
+    private var appContext: android.content.Context? = null
+
+    fun onAppMinimized(context: android.content.Context? = null) {
+        val ctx = context?.applicationContext ?: appContext ?: return
+        appContext = ctx
+        isAppInForeground = false
+        postActiveTaskNotifications(ctx)
+    }
+
+    fun onAppForegrounded(context: android.content.Context? = null) {
+        context?.let { appContext = it.applicationContext }
+        isAppInForeground = true
+    }
+
+    fun postActiveTaskNotifications(context: android.content.Context) {
+        for ((_, task) in activeAiTasks) {
+            updateNotification(
+                context = context,
+                id = task.notificationId,
+                title = task.title,
+                content = task.status,
+                isOngoing = true,
+                chatContextId = task.chatContextId,
+                isExtraction = task.isExtraction,
+                force = true
+            )
+        }
+    }
+
+    fun cancelAiProcessing(context: android.content.Context, chatContextId: String) {
+        activeAiTasks.remove(chatContextId)
+        cancelNotification(context, chatContextId.hashCode())
+        aiProcessingJobs[chatContextId]?.cancel()
+        aiProcessingJobs.remove(chatContextId)
+        setAiProcessingStatus(chatContextId, null)
+        addChatMessage(
+            ChatMessageEntity(bookId = chatContextId, role = "model", content = "Operation cancelled by user.", timestamp = System.currentTimeMillis())
+        )
+    }
+    
+    fun cancelNotification(context: android.content.Context, id: Int) {
+        androidx.core.app.NotificationManagerCompat.from(context).cancel(id)
+    }
+
+    private fun updateNotification(
+        context: android.content.Context, 
+        id: Int, 
+        title: String, 
+        content: String, 
+        isOngoing: Boolean, 
+        chatContextId: String? = null, 
+        isExtraction: Boolean = true,
+        force: Boolean = false
+    ) {
+        if (!isExtraction) return
+        appContext = context.applicationContext
+        if (!force && isAppInForeground && chatContextId != null && activeChatContextId == chatContextId) return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+        }
+        
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                "ai_extraction_channel",
+                "AI Extraction",
+                android.app.NotificationManager.IMPORTANCE_DEFAULT
+            ).apply { description = "Notifications for AI question extraction progress" }
+            val notificationManager = context.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        val builder = androidx.core.app.NotificationCompat.Builder(context, "ai_extraction_channel")
+            .setSmallIcon(com.example.R.drawable.ic_sparkle)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setPriority(if (isOngoing) androidx.core.app.NotificationCompat.PRIORITY_DEFAULT else androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+            .setOngoing(isOngoing)
+            .setAutoCancel(!isOngoing)
+            .setOnlyAlertOnce(isOngoing)
+
+        if (chatContextId != null) {
+            val intent = android.content.Intent(context, com.example.MainActivity::class.java).apply {
+                flags = android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("OPEN_AI_ASSISTANT", true)
+                putExtra("BOOK_ID", chatContextId.removeSuffix("_edit").removeSuffix("_read"))
+                putExtra("CHAT_CONTEXT_ID", chatContextId)
+            }
+            val pendingIntent = android.app.PendingIntent.getActivity(
+                context, 
+                id, 
+                intent, 
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.setContentIntent(pendingIntent)
+        }
+            
+        try {
+            androidx.core.app.NotificationManagerCompat.from(context).notify(id, builder.build())
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+    
+    private fun isZipArchiveUri(contentResolver: android.content.ContentResolver, uri: android.net.Uri): Boolean {
+        return try {
+            contentResolver.openInputStream(uri)?.use { stream ->
+                val header = ByteArray(4)
+                val read = stream.read(header)
+                read >= 4 && header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() && header[2] == 0x03.toByte() && header[3] == 0x04.toByte()
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun startAiProcessing(
+        context: android.content.Context,
+        chatContextId: String,
+        prompt: String,
+        allQuestions: List<QuestionEntity>,
+        mode: com.example.ui.components.AiChatMode,
+        currentContextInfo: String,
+        pdfUri: android.net.Uri? = null,
+        isRetry: Boolean = false
+    ) {
+        appContext = context.applicationContext
+        val notificationId = chatContextId.hashCode()
+        val isExtractionTask = pdfUri != null || mode != com.example.ui.components.AiChatMode.READ_BOOK
+        
+        activeAiTasks[chatContextId] = ActiveAiTask(
+            chatContextId = chatContextId,
+            notificationId = notificationId,
+            title = "AI Assistant",
+            status = "Analyzing request...",
+            isExtraction = isExtractionTask
+        )
+        updateNotification(context, notificationId, "AI Assistant", "Analyzing request...", true, chatContextId, isExtractionTask)
+        
+        if (!isRetry) {
+            addChatMessage(
+                ChatMessageEntity(bookId = chatContextId, role = "user", content = prompt, timestamp = System.currentTimeMillis())
+            )
+        }
+        setAiProcessingStatus(chatContextId, "Analyzing request...", 0f)
+        
+        val job = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                var pdfBytes: ByteArray? = null
+                var extractedTextFromFile: String? = null
+                val attachments = mutableListOf<com.example.data.AiFileAttachment>()
+                
+                if (pdfUri != null) {
+                    val contentResolver = context.contentResolver
+                    val mimeType = contentResolver.getType(pdfUri) ?: ""
+                    val name = pdfUri.lastPathSegment ?: ""
+                    
+                    val isZipArchive = mimeType == "application/zip" || mimeType == "application/x-zip-compressed" || 
+                                       name.endsWith(".zip", true) || 
+                                       (name.endsWith(".qbook", true) && isZipArchiveUri(contentResolver, pdfUri))
+                    val isText = mimeType.startsWith("text/") || 
+                                 name.endsWith(".txt", true) || 
+                                 name.endsWith(".md", true) || 
+                                 name.endsWith(".json", true) || 
+                                 name.endsWith(".js", true) || 
+                                 name.endsWith(".qbook", true)
+                    val isImage = mimeType.startsWith("image/")
+                    
+                    if (isZipArchive) {
+                        activeAiTasks[chatContextId]?.status = "Extracting ZIP / QBook Archive..."
+                        setAiProcessingStatus(chatContextId, "Extracting ZIP / QBook Archive...", 0.1f)
+                        updateNotification(context, notificationId, "AI Assistant", "Extracting ZIP / QBook Archive...", true, chatContextId, isExtractionTask)
+                        val zis = java.util.zip.ZipInputStream(contentResolver.openInputStream(pdfUri))
+                        val textBuilder = StringBuilder()
+                        val availableImages = mutableListOf<String>()
+                        var entry = zis.nextEntry
+                        val resolvedFolderBookId = chatContextId.removeSuffix("_edit").removeSuffix("_read").ifBlank { _currentBookId.value }
+                        val imagesDir = java.io.File(android.os.Environment.getExternalStorageDirectory(), "Quizer/$resolvedFolderBookId/images")
+                        if (!imagesDir.exists()) imagesDir.mkdirs()
+
+                        while (entry != null) {
+                            if (!entry.isDirectory) {
+                                val entryName = entry.name.substringAfterLast("/")
+                                val isEntryText = entryName.endsWith(".qbook", true) || 
+                                                  entryName.endsWith(".json", true) || 
+                                                  entryName.endsWith(".js", true) || 
+                                                  entryName.endsWith(".txt", true) || 
+                                                  entryName.endsWith(".md", true)
+                                if (isEntryText) {
+                                    val bytes = zis.readBytes()
+                                    textBuilder.append(String(bytes)).append("\n\n")
+                                } else if (entryName.endsWith(".png", true) || entryName.endsWith(".jpg", true) || entryName.endsWith(".jpeg", true) || entryName.endsWith(".webp", true)) {
+                                    val file = java.io.File(imagesDir, entryName)
+                                    java.io.FileOutputStream(file).use { fos ->
+                                        zis.copyTo(fos)
+                                    }
+                                    availableImages.add("images/$entryName")
+                                }
+                            }
+                            zis.closeEntry()
+                            entry = zis.nextEntry
+                        }
+                        zis.close()
+                        
+                        if (textBuilder.isNotEmpty()) {
+                            extractedTextFromFile = textBuilder.toString()
+                            if (availableImages.isNotEmpty()) {
+                                extractedTextFromFile += "\n\n[System Note: The attached ZIP archive contains these image files: ${availableImages.joinToString(", ")}.]"
+                            }
+                        }
+                    } else if (isText) {
+                        activeAiTasks[chatContextId]?.status = "Reading Text File..."
+                        setAiProcessingStatus(chatContextId, "Reading Text File...", 0.1f)
+                        updateNotification(context, notificationId, "AI Assistant", "Reading Text File...", true, chatContextId, isExtractionTask)
+                        extractedTextFromFile = contentResolver.openInputStream(pdfUri)?.use { String(it.readBytes()) }
+                    } else if (isImage) {
+                        activeAiTasks[chatContextId]?.status = "Reading Image..."
+                        setAiProcessingStatus(chatContextId, "Reading Image...", 0.1f)
+                        updateNotification(context, notificationId, "AI Assistant", "Reading Image...", true, chatContextId, isExtractionTask)
+                        val bytes = contentResolver.openInputStream(pdfUri)?.use { it.readBytes() }
+                        if (bytes != null) attachments.add(com.example.data.AiFileAttachment(bytes, mimeType))
+                    } else {
+                        activeAiTasks[chatContextId]?.status = "Reading PDF..."
+                        setAiProcessingStatus(chatContextId, "Reading PDF...", 0.1f)
+                        updateNotification(context, notificationId, "AI Assistant", "Reading PDF...", true, chatContextId, isExtractionTask)
+                        pdfBytes = contentResolver.openInputStream(pdfUri)?.use { it.readBytes() }
+                    }
+                }
+                
+                val resolvedBookId = chatContextId
+                    .removeSuffix("_edit")
+                    .removeSuffix("_read")
+                    .ifBlank { _currentBookId.value }
+
+                val (updates, responseText) = com.example.ui.components.processAiChatCommand(
+                    context = context,
+                    command = prompt,
+                    allQuestions = allQuestions,
+                    mode = mode,
+                    chatHistory = chatHistory.value[chatContextId] ?: emptyList(),
+                    currentContextInfo = currentContextInfo,
+                    pdfBytes = pdfBytes,
+                    extractedText = extractedTextFromFile,
+                    attachments = attachments,
+                    targetBookId = resolvedBookId,
+                    onStatusUpdate = { status, progress ->
+                        activeAiTasks[chatContextId]?.status = status
+                        setAiProcessingStatus(chatContextId, status, progress)
+                        updateNotification(context, notificationId, "AI Assistant", status, true, chatContextId, isExtractionTask)
+                    },
+                    onDevLog = { log ->
+                        addDevLog(log)
+                    }
+                )
+                
+                if (updates.isNotEmpty()) {
+                    activeAiTasks.remove(chatContextId)
+                    setPendingUpdates(context, chatContextId, updates)
+                    updateNotification(context, notificationId, "AI Extraction", "Ready for Review", false, chatContextId, isExtractionTask)
+                    addChatMessage(
+                        ChatMessageEntity(bookId = chatContextId, role = "model", content = responseText + "\n\nPlease review the pending updates above.", timestamp = System.currentTimeMillis())
+                    )
+                } else {
+                    activeAiTasks.remove(chatContextId)
+                    updateNotification(context, notificationId, "AI Extraction", "Finished", false, chatContextId, isExtractionTask)
+                    addChatMessage(
+                        ChatMessageEntity(bookId = chatContextId, role = "model", content = responseText, timestamp = System.currentTimeMillis())
+                    )
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                activeAiTasks.remove(chatContextId)
+                updateNotification(context, notificationId, "AI Extraction", "Cancelled", false, chatContextId, isExtractionTask)
+                throw e
+            } catch (e: Exception) {
+                activeAiTasks.remove(chatContextId)
+                updateNotification(context, notificationId, "AI Extraction", "Error: ${e.message}", false, chatContextId, isExtractionTask)
+                addChatMessage(
+                    ChatMessageEntity(bookId = chatContextId, role = "model", content = "Error: ${e.message}", timestamp = System.currentTimeMillis())
+                )
+            } finally {
+                activeAiTasks.remove(chatContextId)
+                setAiProcessingStatus(chatContextId, null)
+                aiProcessingJobs.remove(chatContextId)
+            }
+        }
+        aiProcessingJobs[chatContextId] = job
+    }
+
+    
+    fun startAiPdfProcessing(
+        context: android.content.Context,
+        chatContextId: String,
+        uri: android.net.Uri,
+        allQuestions: List<com.example.data.QuestionEntity>,
+        userInstructions: String? = null
+    ) {
+        val userPromptDisplay = if (!userInstructions.isNullOrBlank()) userInstructions else "Uploaded a PDF for AI extraction."
+        addChatMessage(
+            com.example.data.ChatMessageEntity(bookId = chatContextId, role = "user", content = userPromptDisplay, timestamp = System.currentTimeMillis())
+        )
+        setAiProcessingStatus(chatContextId, "Reading PDF...", 0f)
+        
+        val job = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val contentResolver = context.contentResolver
+                val mimeType = contentResolver.getType(uri) ?: ""
+                val name = uri.lastPathSegment ?: ""
+                val isZipArchive = mimeType == "application/zip" || mimeType == "application/x-zip-compressed" || 
+                                   name.endsWith(".zip", true) || 
+                                   (name.endsWith(".qbook", true) && isZipArchiveUri(contentResolver, uri))
+                val isText = mimeType.startsWith("text/") || 
+                             name.endsWith(".txt", true) || 
+                             name.endsWith(".md", true) || 
+                             name.endsWith(".json", true) || 
+                             name.endsWith(".js", true) || 
+                             name.endsWith(".qbook", true)
+                val isImage = mimeType.startsWith("image/")
+                
+                var bytes: ByteArray? = null
+                var extractedText: String? = null
+                val extractedAttachments = mutableListOf<com.example.data.AiFileAttachment>()
+                
+                if (isZipArchive) {
+                    setAiProcessingStatus(chatContextId, "Extracting ZIP / QBook Archive...", 0.1f)
+                    val zis = java.util.zip.ZipInputStream(contentResolver.openInputStream(uri))
+                    val textBuilder = StringBuilder()
+                    val availableImages = mutableListOf<String>()
+                    var entry = zis.nextEntry
+                    val resolvedFolderBookId = chatContextId.removeSuffix("_edit").removeSuffix("_read").ifBlank { _currentBookId.value }
+                    val imagesDir = java.io.File(android.os.Environment.getExternalStorageDirectory(), "Quizer/$resolvedFolderBookId/images")
+                    if (!imagesDir.exists()) imagesDir.mkdirs()
+
+                    while (entry != null) {
+                        if (!entry.isDirectory) {
+                            val entryName = entry.name.substringAfterLast("/")
+                            val isEntryText = entryName.endsWith(".qbook", true) || 
+                                              entryName.endsWith(".json", true) || 
+                                              entryName.endsWith(".js", true) || 
+                                              entryName.endsWith(".txt", true) || 
+                                              entryName.endsWith(".md", true)
+                            if (isEntryText) {
+                                val b = zis.readBytes()
+                                textBuilder.append(String(b)).append("\n\n")
+                            } else if (entryName.endsWith(".png", true) || entryName.endsWith(".jpg", true) || entryName.endsWith(".jpeg", true) || entryName.endsWith(".webp", true)) {
+                                val file = java.io.File(imagesDir, entryName)
+                                java.io.FileOutputStream(file).use { fos ->
+                                    zis.copyTo(fos)
+                                }
+                                availableImages.add("images/$entryName")
+                            }
+                        }
+                        zis.closeEntry()
+                        entry = zis.nextEntry
+                    }
+                    zis.close()
+                    
+                    if (textBuilder.isNotEmpty()) {
+                        extractedText = textBuilder.toString()
+                        if (availableImages.isNotEmpty()) {
+                            extractedText += "\n\n[System Note: The attached ZIP archive contains these image files: ${availableImages.joinToString(", ")}.]"
+                        }
+                    }
+                } else if (isText) {
+                    setAiProcessingStatus(chatContextId, "Reading Document...", 0.1f)
+                    extractedText = contentResolver.openInputStream(uri)?.use { String(it.readBytes()) }
+                } else if (isImage) {
+                    val imageBytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    if (imageBytes != null) extractedAttachments.add(com.example.data.AiFileAttachment(imageBytes, mimeType))
+                } else {
+                    bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                }
+                
+                setAiProcessingStatus(chatContextId, "Extracting questions via AI...", 0.3f)
+                
+                val sourcePromptStr = if (extractedText != null) "Analyze this uploaded document/qbook:\n$extractedText\n\nExtract all educational questions you can find." else "Analyze this uploaded document/PDF. Extract all educational questions you can find."
+                val shouldOmitHeaders = !userInstructions.isNullOrBlank() && com.example.ui.components.isHeaderOmissionRequested(userInstructions)
+                
+                val headerExtractionRule = if (shouldOmitHeaders) {
+                    """
+                    2. **CRITICAL USER OVERRIDE (HIGHEST PRIORITY) - OMIT ALL HEADERS / SET HEADERS TO NULL**:
+                       - User explicitly instructed: "$userInstructions".
+                       - You MUST set "questionHeader": "" and "section": "" for ALL questions extracted!
+                       - DO NOT analyze, extract, copy, or synthesize any question headers, instructions, directions, reading passages, or section headings from the document into 'questionHeader' or 'section'.
+                       - Leave both 'questionHeader': "" and 'section': "" as empty strings "" for every question.
+                    """.trimIndent()
+                } else {
+                    """
+                    2. **Question Header Extraction & Passage `<p>` Tag**:
+                       - Documents sometimes contain question headers, which are instructions, directions, reading passages, or guidelines applying to a number of questions (e.g. 'Choose one word Substitution (for question from 1 to 10)', 'Read Passages And Answer Questions (1 -10)', 'Directions (Q. 1 to 5): Read the following passage and answer the questions that follow: ...').
+                       - When present, extract these instructions/headers into the 'questionHeader' field.
+                       - For reading comprehension passages or stories, wrap the passage content inside `<p>` or `<p name="Passage Title">` tags (e.g. `Directions (Q. 1 to 5): Read the passage:\n<p name="Passage Title">Passage body text here...</p>`). The app renders `<p>` tags as expandable passage cards and keeps related questions grouped together!
+                       - If an instruction, passage, or direction applies to a group/range of questions, set that EXACT instruction/passage text in the 'questionHeader' field for ALL questions belonging to that group/range.
+                       - DO NOT merge or append the question header instructions into the 'question' text; keep the 'question' field clean and dedicated to the individual question.
+                       - If a question has no preceding instruction or group header, set 'questionHeader' to "".
+                    """.trimIndent()
+                }
+
+                val prompt = """
+                    $sourcePromptStr
+                    ${if (!userInstructions.isNullOrBlank()) "User's Instructions: \"$userInstructions\"\n" else ""}
+                    Rules for Extraction:
+                    1. Extract questions, options, correctIndex, explanation, detailedExplanation, path, format, and questionHeader from the source.
+                    $headerExtractionRule
+                    3. **Math & Formula Formatting (STRICT MANDATE)**:
+                       - Wrap ALL inline mathematical expressions, formulas, and variables in single dollar signs `${"$"}`...${"$"}` (e.g. `${"$"}E = mc^2${"$"}` or `${"$"}x = 1${"$"}` or `${"$"}\frac{1}{2}${"$"}`).
+                       - Block equations MUST use double dollar signs `${"$$"}`...${"$$"}`.
+                       - NEVER output bare LaTeX like `\frac{1}{2}` or `\sqrt{x}` without dollar sign wrappers!
+                       - Format exponents (`x^2`), subscripts (`a_n`), fractions (`\frac{a}{b}`), roots (`\sqrt{x}`), Greek symbols (`\alpha`, `\beta`, `\theta`, `\pi`), and operators cleanly.
+                       - **CRITICAL JSON ESCAPING RULE**: You MUST double-escape all backslashes in LaTeX formulas so they do not break JSON parsing (e.g. `\\frac{1}{2}`, `\\times`, `\\theta`, `\\beta`, `\\neq`).
+                    
+                    4. **NO NULL VALUES (CRITICAL)**: For any parameter with no value or empty content (such as exam, year, explanation, detailedExplanation, questionHeader, section, tableData, etc.), ALWAYS output an empty string "" (or empty list []). NEVER output null or "null"!
+
+                    5. **Mixed `extraOptions` (Correct + Wrong Extra Options)**:
+                       - `extraOptions` can hold additional correct options, additional wrong distractors, OR a **mixture of both correct options and wrong distractors** in the same question!
+                       - Format each item in `"extraOptions"` as `{"text": "Extra option text", "isCorrect": true}` (for correct extra options) or `{"text": "Distractor text", "isCorrect": false}` (for wrong extra distractors), placing correct extra options first (`ext0`, `ext1`, ...).
+                       - In `"correctOptionIds"`, include the correct base option ID(s) `"opt0".."opt3"` AND **ONLY** the `"ext*"` IDs of the **correct** extra options where `"isCorrect": true` (never include wrong `"ext*"` IDs in `"correctOptionIds"`).
+
+                    Format the output strictly as a JSON array containing objects matching this schema:
+                    [
+                      {
+                        "question": "question text",
+                        "options": ["Option A", "Option B", "Option C", "Option D"],
+                        "extraOptions": [{"text": "Correct Extra Option 0", "isCorrect": true}, {"text": "Wrong Extra Option 1", "isCorrect": false}] (if present or requested, else []),
+                        "correctIndex": 0,
+                        "correctOptionIds": ["opt0", "ext0"] (MUST include both the correct base option ID(s) "opt0".."opt3" AND ONLY the "ext*" IDs of correct extraOptions where isCorrect is true),
+                        "multipleCorrect": false (true if >1 option/extraOption is correct),
+                        "explanation": "brief explanation (empty string \"\" if none)",
+                        "detailedExplanation": "detailed explanation if present, or generate one (empty string \"\" if none)",
+                        "path": "Topic/Subtopic based on PDF/document headers (empty string \"\" if none)",
+                        "format": "text",
+                        "questionHeader": ${if (shouldOmitHeaders) "\"\" (User commanded to omit headers - MUST be empty string \"\")" else "\"Instruction / header / passage applying to this question or group. Wrap reading passages in <p>...</p> tags. Set for each question in the group. Empty string \\\"\\\" if none.\""},
+                        "exam": "exam tags if present (e.g. 'SSC CGL 2023'), else \"\"",
+                        "year": "exam year if present, else \"\""
+                      }
+                    ]
+                    If explanations are missing, write them based on the text. If it is a textbook without explicit questions, generate good multiple choice questions from the content.
+                    Return ONLY the JSON array. Do not use markdown blocks like ```json.
+                """.trimIndent()
+                
+                val result = com.example.data.GeminiHelper.generateContent(
+                    context = context, 
+                    prompt = prompt, 
+                    pdfBytes = bytes,
+                    requireJson = true,
+                    attachments = extractedAttachments,
+                    onDevLog = { addDevLog(it) }
+                )
+                
+                if (result.startsWith("Error")) {
+                    addChatMessage(com.example.data.ChatMessageEntity(bookId = chatContextId, role = "model", content = result, timestamp = System.currentTimeMillis()))
+                    setAiProcessingStatus(chatContextId, null)
+                    return@launch
+                }
+                
+                setAiProcessingStatus(chatContextId, "Parsing AI response...", 0.8f)
+                
+                // Parse JSON array
+                val updates = mutableListOf<com.example.ui.components.PendingQuestionUpdate>()
+                val cleanResult = com.example.data.DataParser.autoFixJson(result)
+                val jsonArray = kotlinx.serialization.json.Json.parseToJsonElement(cleanResult).jsonArray
+                
+                val gson = com.example.data.SharedGson.normal
+                val baseBookId = allQuestions.firstOrNull()?.bookId ?: chatContextId.removeSuffix("_edit").removeSuffix("_read")
+                val maxPossibleId = allQuestions.maxOfOrNull { it.id } ?: 0L
+                
+                for (item in jsonArray) {
+                    val obj = item.jsonObject
+                    val parsedOpts = com.example.ui.components.parseAiQuestionOptionsFromJson(obj)
+                    val qOptions = parsedOpts.baseOptions
+                    val qExtraOptions = parsedOpts.extraOptions
+                    val rawHeader = when (val el = obj["questionHeader"] ?: obj["section"] ?: obj["header"]) {
+                        is kotlinx.serialization.json.JsonObject -> el.toString()
+                        is kotlinx.serialization.json.JsonPrimitive -> {
+                            if (el !is kotlinx.serialization.json.JsonNull) {
+                                val c = el.content.trim()
+                                if (c.isNotBlank() && !c.equals("null", ignoreCase = true) && !c.equals("undefined", ignoreCase = true) && !c.equals("none", ignoreCase = true)) c else null
+                            } else null
+                        }
+                        else -> null
+                    }
+                    val rawQuestion = obj.optCleanString("question") ?: ""
+                    val questionText = com.example.ui.components.cleanExtractedMathText(rawQuestion)
+                    val rawExplanation = obj.optCleanString("explanation") ?: ""
+                    val explanation = com.example.ui.components.cleanExtractedMathText(rawExplanation)
+                    val rawDetailed = obj.optCleanString("detailedExplanation")
+                    val detailedExplanation = rawDetailed?.let { com.example.ui.components.cleanExtractedMathText(it) }?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                    val cleanedHeader = if (shouldOmitHeaders) null else rawHeader?.let { com.example.ui.components.cleanExtractedMathText(it) }?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                    val exam = obj.optCleanString("exam") ?: ""
+                    val year = obj.optCleanString("year") ?: ""
+                    val format = obj.optCleanString("format")?.takeIf { it.equals("table", ignoreCase = true) } ?: "text"
+                    val tableData = obj.optCleanString("tableData")?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                    val section = if (shouldOmitHeaders) "" else (cleanedHeader ?: obj.optCleanString("section") ?: "")
+                    val path = obj.optCleanString("path") ?: ""
+
+                    val generatedOptions = qOptions.mapIndexed { idx, txt ->
+                        com.example.data.QBookOption(id = "opt$idx", text = txt)
+                    }
+                    val correctOptionIds = com.example.ui.components.parseAiCorrectOptionIds(
+                        obj = obj,
+                        optionCount = generatedOptions.size,
+                        extraOptionCount = qExtraOptions.size,
+                        baseOptionsText = qOptions,
+                        extraOptionsText = qExtraOptions,
+                        inlineCorrectIds = parsedOpts.inlineCorrectIds,
+                        inlineWrongIds = parsedOpts.inlineWrongIds
+                    )
+                    val primaryIdx = correctOptionIds.firstNotNullOfOrNull { cid ->
+                        if (cid.startsWith("opt")) cid.removePrefix("opt").toIntOrNull()?.takeIf { it in generatedOptions.indices } else null
+                    } ?: (obj["correctIndex"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0)
+                    val isMulti = (obj["multipleCorrect"]?.jsonPrimitive?.content?.equals("true", ignoreCase = true) == true) ||
+                        correctOptionIds.size > 1 ||
+                        correctOptionIds.any { it.startsWith("ext", ignoreCase = true) }
+
+                    val updatedQ = com.example.data.QuestionEntity(
+                        globalId = java.util.UUID.randomUUID().toString(),
+                        id = maxPossibleId + 1 + updates.size.toLong(),
+                        bookId = baseBookId,
+                        category = obj.optCleanString("category")?.takeIf { it.isNotBlank() } ?: "AI Extracted",
+                        question = questionText,
+                        options = gson.toJson(qOptions),
+                        advancedOptions = gson.toJson(generatedOptions),
+                        advancedCorrectIds = gson.toJson(correctOptionIds),
+                        extraOptions = gson.toJson(qExtraOptions),
+                        correctIndex = primaryIdx,
+                        multipleCorrect = isMulti,
+                        explanation = explanation,
+                        detailedExplanation = detailedExplanation,
+                        format = format,
+                        tableData = tableData,
+                        section = section,
+                        exam = exam,
+                        year = year,
+                        path = path,
+                        questionHeader = cleanedHeader
+                    )
+                    
+                    updates.add(com.example.ui.components.PendingQuestionUpdate(-1L, updatedQ))
+                }
+                
+                val processedUpdates = if (shouldOmitHeaders) {
+                    updates.map { pending ->
+                        val q = pending.updatedQuestion
+                        pending.copy(updatedQuestion = q.copy(questionHeader = null, section = ""))
+                    }
+                } else {
+                    com.example.ui.components.processExtractedQuestionHeaders(updates)
+                }
+                if (processedUpdates.isNotEmpty()) {
+                    setPendingUpdates(context, chatContextId, processedUpdates)
+                    addChatMessage(
+                        com.example.data.ChatMessageEntity(bookId = chatContextId, role = "model", content = "I extracted ${processedUpdates.size} questions from the document. Please review the pending updates above.", timestamp = System.currentTimeMillis())
+                    )
+                } else {
+                    addChatMessage(
+                        com.example.data.ChatMessageEntity(bookId = chatContextId, role = "model", content = "I couldn't find or generate any questions from the document.", timestamp = System.currentTimeMillis())
+                    )
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                addDevLog("[JSON PARSE ERROR] ${e.message}")
+                addChatMessage(com.example.data.ChatMessageEntity(bookId = chatContextId, role = "model", content = "The AI returned invalid JSON. Check Developer Logs for details.", timestamp = System.currentTimeMillis()))
+            } finally {
+                setAiProcessingStatus(chatContextId, null)
+            }
+        }
+        
+        aiProcessingJobs[chatContextId] = job
+    }
+fun setPendingUpdates(context: android.content.Context, chatContextId: String, updates: List<com.example.ui.components.PendingQuestionUpdate>?) {
+        if (updates == null || updates.isEmpty()) {
+            cancelNotification(context, chatContextId.hashCode())
+        }
+        val current = _pendingUpdates.value.toMutableMap()
+        if (updates == null) {
+            current.remove(chatContextId)
+        } else {
+            current[chatContextId] = updates
+        }
+        _pendingUpdates.value = current
+    }
+
+
+    fun loadChatHistory(bookId: String) {
+        viewModelScope.launch {
+            val list = repository.getChatsForBook(bookId)
+            _chatHistory.value = _chatHistory.value.toMutableMap().apply { put(bookId, list) }
+        }
+    }
+
+    fun addChatMessage(chat: com.example.data.ChatMessageEntity) {
+        viewModelScope.launch {
+            repository.insertChat(chat)
+            val list = repository.getChatsForBook(chat.bookId)
+            _chatHistory.value = _chatHistory.value.toMutableMap().apply { put(chat.bookId, list) }
+        }
+    }
+    
+    fun deleteChatMessage(id: Long, bookId: String) {
+        viewModelScope.launch {
+            repository.deleteChat(id)
+            val list = repository.getChatsForBook(bookId)
+            _chatHistory.value = _chatHistory.value.toMutableMap().apply { put(bookId, list) }
+        }
+    }
+
+    fun deleteChatMessagesBatch(ids: List<Long>, bookId: String, onComplete: () -> Unit = {}) {
+        viewModelScope.launch {
+            for (id in ids) {
+                repository.deleteChat(id)
+            }
+            val list = repository.getChatsForBook(bookId)
+            _chatHistory.value = _chatHistory.value.toMutableMap().apply { put(bookId, list) }
+            onComplete()
+        }
+    }
+
+    fun clearChatHistory(bookId: String) {
+        viewModelScope.launch {
+            repository.clearChatsForBook(bookId)
+            _chatHistory.value = _chatHistory.value.toMutableMap().apply { remove(bookId) }
+        }
+    }
+
+
+
+    private val _bookOrder = MutableStateFlow(settingsManager.getBookOrder())
+    val books = combine(repository.books, _bookOrder) { rawBooks, order ->
+        if (order.isEmpty()) {
+            rawBooks
+        } else {
+            val orderMap = order.withIndex().associate { it.value to it.index }
+            rawBooks.sortedWith(compareBy({ orderMap[it.id] ?: (Int.MAX_VALUE - 1000) }, { it.name }))
+        }
+    }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    fun reorderBooks(newOrder: List<String>) {
+        _bookOrder.value = newOrder
+        settingsManager.setBookOrder(newOrder)
+    }
+    
+    private val _verificationStatus = MutableStateFlow<String?>(null)
+    val verificationStatus = _verificationStatus.asStateFlow()
+    private val _verificationMessage = MutableStateFlow<String?>(null)
+    private val _fixRequiredMessage = MutableStateFlow<String?>(null)
+    val fixRequiredMessage = _fixRequiredMessage.asStateFlow()
+    private var pendingBookUri: android.net.Uri? = null
+
+    val verificationMessage = _verificationMessage.asStateFlow()
+
+    private val initialBookId = settingsManager.lastSelectedBookId ?: "BMW_Vol_1"
+    private val _currentBookId = MutableStateFlow(initialBookId)
+    val currentBookId = _currentBookId.asStateFlow()
+
+    private val _activeQuizTrigger = MutableStateFlow(0)
+    val hasActiveQuiz = combine(_currentBookId, _activeQuizTrigger) { bookId, _ ->
+        settingsManager.getActiveQuizState(bookId) != null
+    }.stateIn(viewModelScope, SharingStarted.Lazily, false)
+
+    private val _allBookQuestionSummaries = MutableStateFlow<List<com.example.data.QuestionSummary>>(emptyList())
+    val allBookQuestionSummaries = _allBookQuestionSummaries.asStateFlow()
+    
+    private val _selectedCategories = MutableStateFlow<Set<String>>(settingsManager.getSelectedCategories(initialBookId))
+    val selectedCategories = _selectedCategories.asStateFlow()
+    
+    private val _questionLimit = MutableStateFlow<Int?>(run {
+        val limit = settingsManager.getQuestionLimit(initialBookId)
+        if (limit == 0) null else limit
+    }) // null means all
+    val questionLimit = _questionLimit.asStateFlow()
+
+    private val _onlyBookmarks = MutableStateFlow(false)
+    val onlyBookmarks = _onlyBookmarks.asStateFlow()
+
+    private val _quizFlowMode = MutableStateFlow(settingsManager.getQuizFlowMode(initialBookId))
+    val quizFlowMode = _quizFlowMode.asStateFlow()
+
+    fun setQuizFlowMode(mode: String) {
+        if (_quizFlowMode.value != mode) {
+            _quizFlowMode.value = mode
+            settingsManager.setQuizFlowMode(_currentBookId.value, mode)
+            generateQuizQuestions()
+        }
+    }
+
+    private val _shuffleQuestions = MutableStateFlow(settingsManager.getShuffleQuestions(initialBookId))
+    val shuffleQuestions = _shuffleQuestions.asStateFlow()
+
+    fun setShuffleQuestions(shuffle: Boolean) {
+        if (_shuffleQuestions.value != shuffle) {
+            _shuffleQuestions.value = shuffle
+            settingsManager.setShuffleQuestions(_currentBookId.value, shuffle)
+            generateQuizQuestions()
+        }
+    }
+
+    fun setOnlyBookmarks(value: Boolean) {
+        if (_onlyBookmarks.value != value) {
+            _onlyBookmarks.value = value
+            generateQuizQuestions()
+        }
+    }
+
+    fun setQuizQuestionsForBookmarks() {
+        resetTransientQuizSessionState()
+        isLearnMode = false
+        isActiveQuizStandardSequence = false
+        activeQuizSourceTag = "Bookmarks"
+        currentExamSettings = null
+        activeRetainedOptionIndices = settingsManager.getRetainedQuestionOptions(_currentBookId.value)
+
+        val bookmarkedIds = bookmarks.value.map { it.questionId }
+        val allQs = _allBookQuestionSummaries.value
+        val bookmarkedQs = allQs.filter { it.id in bookmarkedIds }
+        applySortingAndLimitToQuestions(bookmarkedQs)
+    }
+
+    private val _quizQuestions = MutableStateFlow<List<QuestionEntity>>(emptyList())
+    val questions = _quizQuestions.asStateFlow()
+    
+    private val _selectedPaths = MutableStateFlow<Set<String>>(settingsManager.getSelectedPaths(initialBookId))
+    val selectedPaths = _selectedPaths.asStateFlow()
+
+    fun clearVerificationStatus() {
+        _verificationStatus.value = null
+        _verificationMessage.value = null
+    }
+
+    fun addCustomBook(context: android.content.Context, uri: android.net.Uri, allowAutoFix: Boolean = false, isPermanentUpdate: Boolean = false) {
+        if (_verificationStatus.value == "verifying") return
+        viewModelScope.launch {
+            _verificationStatus.value = "verifying"
+            _verificationMessage.value = "Verifying book format..."
+            
+            val errorMsg = com.example.data.DataParser.parseAndInsertFromUri(context, repository, uri, allowAutoFix, isPermanentUpdate) { progressMsg ->
+                _verificationMessage.value = progressMsg
+            }
+            
+            if (errorMsg != null && errorMsg.startsWith("FIX_REQUIRED|")) {
+                _verificationStatus.value = null
+                pendingBookUri = uri
+                _fixRequiredMessage.value = errorMsg.substringAfter("FIX_REQUIRED|")
+            } else if (errorMsg == null) {
+                _verificationStatus.value = "success"
+                _verificationMessage.value = "Verified and added to book list"
+                if (_currentBookId.value.isNotEmpty()) {
+                    selectBook(_currentBookId.value, forceRefresh = true)
+                }
+            } else {
+                _verificationStatus.value = "error"
+                _verificationMessage.value = "Verification failed: $errorMsg"
+            }
+        }
+    }
+
+    fun generateBlankBookId(bookName: String): String {
+        val cleanLetters = bookName
+            .trim()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .let { words ->
+                if (words.size >= 2) {
+                    words.take(4).joinToString("") { w ->
+                        w.filter { it.isLetterOrDigit() }.take(1).uppercase()
+                    }
+                } else {
+                    words.firstOrNull()?.filter { it.isLetterOrDigit() }?.take(4)?.uppercase() ?: ""
+                }
+            }
+            .ifBlank { "QB" }
+        val suffix = (10000..99999).random()
+        return "${cleanLetters}#$suffix"
+    }
+
+    fun generateBlankBookVersion(): String {
+        return "Q1E1.0.0"
+    }
+
+    fun createBlankQBook(
+        context: android.content.Context,
+        bookName: String,
+        bookId: String,
+        bookVersion: String,
+        hierarchyLabels: List<String>,
+        defaultCategory: String = "",
+        defaultExam: String = "",
+        onCreated: (String) -> Unit = {}
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val cleanName = bookName.trim().ifBlank { "Untitled Book" }
+                val cleanId = bookId.trim()
+                    .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    .ifBlank { generateBlankBookId(cleanName) }
+                val cleanVersion = bookVersion.trim().ifBlank { "Q1E1.0.0" }
+                val cleanHierarchy = hierarchyLabels.map { it.trim() }.filter { it.isNotBlank() }
+                    .ifEmpty { listOf("Book", "Chapter", "Topic") }
+
+                val gson = com.google.gson.GsonBuilder().setPrettyPrinting().create()
+                val basePath = android.os.Environment.getExternalStorageDirectory().absolutePath
+                val quizerDir = java.io.File(basePath, "Quizer")
+                if (!quizerDir.exists()) quizerDir.mkdirs()
+
+                val bookDir = java.io.File(quizerDir, cleanId)
+                if (!bookDir.exists()) bookDir.mkdirs()
+                val imagesDir = java.io.File(bookDir, "images")
+                if (!imagesDir.exists()) imagesDir.mkdirs()
+                com.example.data.MediaScannerHelper.ensureNoMediaInDir(imagesDir)
+
+                // Remove from removedBooks blacklist if it was ever deleted previously
+                val updatedRemoved = settingsManager.removedBooks.toMutableSet()
+                if (updatedRemoved.remove(cleanId)) {
+                    settingsManager.removedBooks = updatedRemoved
+                }
+
+                // Write initial book_meta.json and empty backup_questions.json
+                val meta = com.example.data.QBookMeta(
+                    id = cleanId,
+                    name = cleanName,
+                    version = cleanVersion,
+                    hierarchyLabels = cleanHierarchy,
+                    updateVersion = emptyList(),
+                    questionIdStart = 0L,
+                    questionIdEnd = 0L
+                )
+                val metaJson = gson.toJson(meta)
+                java.io.File(bookDir, "book_meta.json").writeText(metaJson)
+                java.io.File(bookDir, "backup_questions.json").writeText("[]")
+
+                // Save default category/exam hints in SecurePrefs if provided so AI extraction can use them
+                if (defaultCategory.isNotBlank() || defaultExam.isNotBlank()) {
+                    val sp = com.example.data.SecurePrefs.get(context)
+                    sp.edit()
+                        .putString("blank_book_default_cat_$cleanId", defaultCategory.trim())
+                        .putString("blank_book_default_exam_$cleanId", defaultExam.trim())
+                        .apply()
+                }
+
+                // Insert the blank BookEntity into Room
+                val bookEntity = com.example.data.BookEntity(
+                    id = cleanId,
+                    name = cleanName,
+                    totalQuestions = 0,
+                    totalCategories = 0,
+                    isFavorite = false,
+                    addedAt = System.currentTimeMillis(),
+                    dataVariable = "QBOOK",
+                    updateId = "QBOOK_INITIAL",
+                    bookVersion = cleanVersion,
+                    updateVersions = "[]",
+                    questionIdStart = 0L,
+                    questionIdEnd = 0L,
+                    hierarchyLabels = com.example.data.SharedGson.normal.toJson(cleanHierarchy),
+                    roadmapLeafLevel = cleanHierarchy.size.coerceAtLeast(1)
+                )
+                repository.insertBook(bookEntity)
+
+                // Export valid blank .qbook archive to Quizer/<cleanId>.qbook
+                val targetQBookFile = java.io.File(quizerDir, "${cleanId}.qbook")
+                com.example.ui.screens.exportQBook(context, repository, cleanId, targetQBookFile)
+
+                // Select the newly created blank book
+                withContext(Dispatchers.Main) {
+                    selectBook(cleanId, forceRefresh = true)
+                    onCreated(cleanId)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(
+                        context,
+                        "Failed to create blank qbook: ${e.message}",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    fun renameBook(bookId: String, newName: String) {
+        viewModelScope.launch {
+            val dbBook = repository.getBookSync(bookId) ?: return@launch
+            val updated = dbBook.copy(name = newName)
+            repository.insertBook(updated)
+        }
+    }
+
+    fun makeUpdatePermanent(context: android.content.Context, bookId: String, updateId: String) {
+        viewModelScope.launch {
+            val dbBook = books.value.find { it.id == bookId } ?: return@launch
+            val updatesStr = dbBook.updateVersions
+            val gson = com.example.data.SharedGson.normal
+            val type = object : com.google.gson.reflect.TypeToken<List<Map<String, List<Long>>>>() {}.type
+            val updateList: MutableList<Map<String, List<Long>>> = gson.fromJson(updatesStr, type) ?: mutableListOf()
+            
+            val updateEntryIdx = updateList.indexOfFirst { it.containsKey(updateId) }
+            if (updateEntryIdx != -1) {
+                // Remove from updates list
+                updateList.removeAt(updateEntryIdx)
+                
+                // Update book in DB
+                val updatedBook = dbBook.copy(
+                    updateVersions = gson.toJson(updateList)
+                )
+                repository.insertBook(updatedBook)
+                
+                // Export base file
+                val basePath = android.os.Environment.getExternalStorageDirectory().absolutePath
+                val targetFile = java.io.File(basePath, "Quizer/${bookId}.qbook")
+                com.example.ui.screens.exportQBook(context, repository, bookId, targetFile)
+                
+                // Delete update file
+                try {
+                    val updatesDir = java.io.File(basePath, "Quizer/Updates")
+                    val updateFile = java.io.File(updatesDir, "${bookId}_${updateId}.qbook")
+                    if (updateFile.exists()) {
+                        updateFile.delete()
+                    }
+                } catch(e: Exception) {}
+                
+                // Refresh book data and sync to app
+                if (currentBookId.value == bookId) {
+                    selectBook(bookId, forceRefresh = true)
+                }
+            }
+        }
+    }
+
+    fun reverseUpdate(bookId: String, updateId: String) {
+        viewModelScope.launch {
+            val dbBook = books.value.find { it.id == bookId } ?: return@launch
+            val updatesStr = dbBook.updateVersions
+            val gson = com.example.data.SharedGson.normal
+            val type = object : com.google.gson.reflect.TypeToken<List<Map<String, List<Long>>>>() {}.type
+            val updateList: MutableList<Map<String, List<Long>>> = gson.fromJson(updatesStr, type) ?: mutableListOf()
+            
+            // Find the update map containing the updateId
+            val updateEntryIdx = updateList.indexOfFirst { it.containsKey(updateId) }
+            if (updateEntryIdx != -1) {
+                val updateEntry = updateList[updateEntryIdx]
+                val range = updateEntry[updateId]
+                if (range != null && range.size == 2) {
+                    val startId = range[0].toLong()
+                    val endId = range[1].toLong()
+                    
+                    // Delete questions from DB
+                    repository.deleteQuestionsInRange(bookId, startId, endId)
+                    
+                    // Remove from updates list
+                    updateList.removeAt(updateEntryIdx)
+                    
+                    // Update book
+                    val removedCount = (endId - startId + 1).toInt()
+                    val updatedBook = dbBook.copy(
+                        totalQuestions = maxOf(0, dbBook.totalQuestions - removedCount),
+                        updateVersions = gson.toJson(updateList)
+                    )
+                    repository.insertBook(updatedBook)
+                    
+                    // Also delete from Updates folder
+                    try {
+                        val basePath = android.os.Environment.getExternalStorageDirectory().absolutePath
+                        val updatesDir = java.io.File(basePath, "Quizer/Updates")
+                        val updateFile = java.io.File(updatesDir, "${bookId}_${updateId}.qbook")
+                        if (updateFile.exists()) {
+                            updateFile.delete()
+                        }
+                    } catch(e: Exception) {}
+                    
+                    // Refresh
+                    if (_currentBookId.value == bookId) {
+                        selectBook(bookId, forceRefresh = true)
+                    }
+                }
+            }
+        }
+    }
+    
+    fun togglePath(path: String) {
+        val current = _selectedPaths.value.toMutableSet()
+        val isSelected = current.any { path == it || path.startsWith("$it/") }
+        
+        val root = _topicTreeRoot.value
+        
+        if (isSelected) {
+            // Uncheck
+            if (current.contains(path)) {
+                current.remove(path)
+            } else if (root != null) {
+                // An ancestor is selected. Remove all ancestors and add their other children.
+                val ancestors = current.filter { path.startsWith("$it/") }
+                current.removeAll(ancestors.toSet())
+                
+                for (ancestorPath in ancestors) {
+                    // Find the ancestor node in the tree
+                    fun findNode(node: com.example.data.TopicNode, target: String): com.example.data.TopicNode? {
+                        if (node.path == target) return node
+                        for (child in node.children.values) {
+                            if (target.startsWith(child.path)) {
+                                val found = findNode(child, target)
+                                if (found != null) return found
+                            }
+                        }
+                        return null
+                    }
+                    
+                    val ancestorNode = findNode(root, ancestorPath) ?: continue
+                    
+                    // We need to add all descendants of ancestorNode that are NOT on the path to the removed node
+                    // Wait, a simpler way is just to add all immediate children of all nodes along the path from ancestor to the removed node, EXCEPT the ones on the path.
+                    var currNode: com.example.data.TopicNode? = ancestorNode
+                    val pathParts = path.removePrefix(ancestorPath + "/").split("/")
+                    
+                    for (part in pathParts) {
+                        if (currNode == null) break
+                        for (child in currNode.children.values) {
+                            if (child.name != part) {
+                                current.add(child.path)
+                            }
+                        }
+                        currNode = currNode.children[part]
+                    }
+                }
+            }
+        } else {
+            // Check
+            current.add(path)
+            current.removeIf { it.startsWith("$path/") } // Remove redundant descendants
+            
+            // Optional: Check if all siblings are now checked, and if so, replace them with parent
+            // But this is good enough.
+        }
+        _selectedPaths.value = current
+        settingsManager.setSelectedPaths(_currentBookId.value, current)
+    }
+    
+    private val _selectedTopic = MutableStateFlow<TopicNode?>(null)
+
+    fun resetTransientQuizSessionState() {
+        activeCurrentIndex = 0
+        activeQTimes = mutableMapOf()
+        activeSelectedAnswers = mutableMapOf()
+        activeLockedAnswers = mutableMapOf()
+        activeTimeRemainingMs = -1L
+        activeQuizSessionId = System.currentTimeMillis()
+        activeRetainedOptionIndices = emptyMap()
+        currentPracticeMistakesParentId = null
+    }
+
+    /**
+     * Restores the standard Home quiz question pool if the user previously launched a non-Home quiz
+     * (such as Practice Mistakes, Search, Bookmarks, Learn, or Analysis Drills) that overwrote `_quizQuestions`.
+     */
+    fun restoreHomeQuizPoolIfNeeded() {
+        if (!isActiveQuizStandardSequence || activeQuizSourceTag != "Quiz" || isLearnMode || currentPracticeMistakesParentId != null) {
+            isLearnMode = false
+            isActiveQuizStandardSequence = true
+            activeQuizSourceTag = "Quiz"
+            currentPracticeMistakesParentId = null
+            currentExamSettings = null
+            activeRetainedOptionIndices = emptyMap()
+            generateQuizQuestions()
+        }
+    }
+
+    fun setQuizQuestionsByTopic(topic: TopicNode) {
+        startLearnTopicQuiz(topic, onReady = null)
+    }
+
+    fun startLearnTopicQuiz(topic: TopicNode, onReady: (() -> Unit)? = null) {
+        isLearnMode = true
+        isActiveQuizStandardSequence = false
+        activeQuizSourceTag = "Learn"
+        currentExamSettings = null
+        currentPracticeMistakesParentId = null
+        resetTransientQuizSessionState()
+        _selectedTopic.value = topic
+        _onlyBookmarks.value = false
+        val allQs = _allBookQuestionSummaries.value
+        val questionsInTopic = allQs.filter { it.id in topic.questionIds }
+        applySortingAndLimitToQuestions(questionsInTopic, onReady)
+    }
+
+  fun setQuizQuestionsForDailyRevision(limit: Int? = null, onReady: (() -> Unit)? = null) {
+    val now = System.currentTimeMillis()
+    val statsMap = allStats.value.associateBy { it.questionId }
+    val allQs = _allBookQuestionSummaries.value
+    val revisionIds = allQs.filter { q ->
+        val stat = statsMap[q.id]
+        stat != null && stat.attempts > 0 && stat.nextReview in 1L..now
+      }.sortedBy { q -> statsMap[q.id]?.nextReview ?: Long.MAX_VALUE }.map { it.id }
+    startTargetedAnalysisDrill(revisionIds, limit = limit, onReady = onReady)
+  }
+
+  fun setQuizQuestionsForWeakTopics(limit: Int? = null, onReady: (() -> Unit)? = null) {
+    val now = System.currentTimeMillis()
+    val statsMap = allStats.value.associateBy { it.questionId }
+    val allQs = _allBookQuestionSummaries.value
+
+    // Identify weak topics (< 65% topic accuracy with at least 1 attempt) plus individual weak questions (< 60% accuracy)
+    val topicGroups = allQs.groupBy { q ->
+      q.path.trim().ifBlank { q.category.trim().ifBlank { "General" } }
+    }
+    val weakTopicKeys = topicGroups.filter { (_, qs) ->
+      val tStats = qs.mapNotNull { statsMap[it.id] }
+      val att = tStats.sumOf { it.attempts }
+      val corr = tStats.sumOf { it.correct }
+      att > 0 && (corr.toFloat() / att.toFloat()) < 0.65f
+    }.keys
+
+    val weakCandidates = allQs.filter { q ->
+      val st = statsMap[q.id]
+      val topicKey = q.path.trim().ifBlank { q.category.trim().ifBlank { "General" } }
+      val isIndividualWeak = st != null && st.attempts > 0 && !QuestionPoolProcessor.isQuestionMastered(st) &&
+        ((st.correct.toFloat() / st.attempts.toFloat()) < 0.65f || st.wrong > 0)
+      val isInWeakTopic = topicKey in weakTopicKeys && (st == null || !QuestionPoolProcessor.isQuestionMastered(st))
+      isIndividualWeak || isInWeakTopic
+    }.sortedWith(
+      compareByDescending<com.example.data.QuestionSummary> { q ->
+        val st = statsMap[q.id]
+        st != null && st.wrong > 0 && !QuestionPoolProcessor.isQuestionMastered(st)
+      }.thenByDescending { q ->
+        val st = statsMap[q.id]
+        if (st != null && st.wrong > 0) QuestionPoolProcessor.computeMistakeUrgencyScore(st, now) else 0f
+      }.thenBy { q ->
+        val st = statsMap[q.id]
+        if (st != null && st.attempts > 0) st.correct.toFloat() / st.attempts.toFloat() else 0.5f
+      }
+    ).map { it.id }
+
+    startTargetedAnalysisDrill(weakCandidates, limit = limit, onReady = onReady)
+  }
+
+  fun setQuizQuestionsForCritical(limit: Int? = 30, onReady: (() -> Unit)? = null) {
+    val now = System.currentTimeMillis()
+    val statsMap = allStats.value.associateBy { it.questionId }
+    val allQs = _allBookQuestionSummaries.value
+    val criticalIds = allQs.filter { q -> (statsMap[q.id]?.wrong ?: 0) > 0 }.sortedWith(
+        compareByDescending<com.example.data.QuestionSummary> { q ->
+          val st = statsMap[q.id]
+          st != null && !QuestionPoolProcessor.isQuestionMastered(st)
+        }.thenByDescending { q ->
+          val st = statsMap[q.id]
+          if (st != null) QuestionPoolProcessor.computeMistakeUrgencyScore(st, now) else 0f
+        }
+      ).map { it.id }
+    startTargetedAnalysisDrill(criticalIds, limit = limit, onReady = onReady)
+  }
+
+  fun setQuizQuestionsForConsolidation(limit: Int? = null, onReady: (() -> Unit)? = null) {
+    val statsMap = allStats.value.associateBy { it.questionId }
+    val allQs = _allBookQuestionSummaries.value
+    val consolidatingIds = allQs.filter { q ->
+        val stat = statsMap[q.id]
+        stat != null && stat.attempts > 0 && !QuestionPoolProcessor.isQuestionMastered(stat) && stat.streak in 1..2
+      }.sortedWith(
+        compareByDescending<com.example.data.QuestionSummary> { q ->
+          statsMap[q.id]?.streak ?: 0
+        }.thenBy { q ->
+          statsMap[q.id]?.lastSeen ?: 0L
+        }
+      ).map { it.id }
+    startTargetedAnalysisDrill(consolidatingIds, limit = limit, onReady = onReady)
+  }
+
+  fun startTargetedAnalysisDrill(
+    questionIds: List<Long>, limit: Int? = null, onReady:(() -> Unit)? = null
+  ) {
+    val bookId = _currentBookId.value
+    if (bookId.isBlank() || questionIds.isEmpty()) return
+    isLearnMode = false
+    isActiveQuizStandardSequence = false
+    activeQuizSourceTag = "Revision"
+    currentExamSettings = null
+    currentPracticeMistakesParentId = null
+    resetTransientQuizSessionState()
+    activeRetainedOptionIndices = settingsManager.getRetainedQuestionOptions(bookId)
+    _selectedTopic.value = null
+    _onlyBookmarks.value = false
+
+    val distinctIds = questionIds.distinct()
+    val finalIds = if (limit != null && limit > 0) distinctIds.take(limit) else distinctIds
+
+    quizGenJob?.cancel()
+    quizGenJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+      val indexMap = finalIds.withIndex().associate { it.value to it.index }
+      val fullQuestions = repository.getQuestionsByBookAndIds(bookId, finalIds).resolveHeaders()
+      if (isActive) {
+        _quizQuestions.value = fullQuestions.sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+        activeQuizSessionId = System.currentTimeMillis()
+        if (onReady != null) {
+          withContext(kotlinx.coroutines.Dispatchers.Main) {
+            onReady.invoke()
+          }
+        }
+      }
+    }
+  }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun processQuestionPool(
+        pool: List<com.example.data.QuestionSummary>,
+        flowMode: String,
+        isShuffle: Boolean,
+        limit: Int?,
+        offset: Int = 1,
+        customStatsMap: Map<Long, com.example.data.QuestionStatEntity>? = null
+    ): List<com.example.data.QuestionSummary> {
+        val statsMap = customStatsMap ?: allStats.value.associateBy { it.questionId }
+        return QuestionPoolProcessor.process(pool, flowMode, isShuffle, limit, offset, statsMap)
+    }
+
+    private fun applySortingAndLimitToQuestions(
+        baseList: List<com.example.data.QuestionSummary>,
+        onReady: (() -> Unit)? = null
+    ) {
+        val bookId = _currentBookId.value
+        val currentFlow = if (isLearnMode) settingsManager.getLearnFlowMode(bookId) else _quizFlowMode.value
+        val currentShuffle = if (isLearnMode) settingsManager.getLearnShuffleQuestions(bookId) else _shuffleQuestions.value
+        val rawLearnLimit = settingsManager.getLearnQuestionLimit(bookId)
+        val currentLimit: Int? = if (isLearnMode) {
+            if (rawLearnLimit > 0) rawLearnLimit else null
+        } else {
+            null
+        }
+
+        quizGenJob?.cancel()
+        quizGenJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val filtered = processQuestionPool(baseList, currentFlow, currentShuffle, currentLimit)
+            val idsToFetch = filtered.map { it.id }
+            val indexMap = idsToFetch.withIndex().associate { it.value to it.index }
+            val fullQuestions = repository.getQuestionsByBookAndIds(bookId, idsToFetch).resolveHeaders()
+            if (isActive) {
+                _quizQuestions.value = fullQuestions.sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+                if (onReady != null) {
+                    withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        onReady.invoke()
+                    }
+                }
+            }
+        }
+    }
+
+    private val _sequenceOffset = MutableStateFlow(settingsManager.getSequenceOffset(initialBookId))
+    val sequenceOffset = _sequenceOffset.asStateFlow()
+
+    fun setSequenceOffset(offset: Int) {
+        val coerced = offset.coerceAtLeast(1)
+        _sequenceOffset.value = coerced
+        settingsManager.setSequenceOffset(_currentBookId.value, coerced)
+        generateQuizQuestions()
+    }
+    
+    fun generateQuizQuestions() {
+        isActiveQuizStandardSequence = true
+        activeQuizSourceTag = "Quiz"
+        activeRetainedOptionIndices = emptyMap()
+        quizGenJob?.cancel()
+        quizGenJob = viewModelScope.launch(Dispatchers.Default) {
+            _selectedTopic.value = null // clear strict topic filter
+            val targetBookId = _currentBookId.value
+            if (targetBookId.isBlank()) {
+                _quizQuestions.value = emptyList()
+                return@launch
+            }
+            val cachedQs = _allBookQuestionSummaries.value
+            val allQs = if (cachedQs.isNotEmpty() && cachedQs.first().bookId == targetBookId) {
+                cachedQs
+            } else {
+                withContext(Dispatchers.IO) {
+                    repository.getQuestionSummariesForBook(targetBookId).first()
+                }
+            }
+            val paths = _selectedPaths.value
+            val categories = _selectedCategories.value
+            val limit = _questionLimit.value
+            val isBookmarks = _onlyBookmarks.value
+            val bookmarkedIds = bookmarks.value.map { it.questionId }
+            val offset = _sequenceOffset.value
+
+            // Filter by selected scopes directly via matchesSelectedPaths so book switching never
+            // suffers from a stale _topicTreeRoot from the previous book.
+            var filtered = if (isBookmarks) {
+                allQs.filter { it.id in bookmarkedIds }
+            } else if (paths.isNotEmpty()) {
+                allQs.filter { q -> q.matchesSelectedPaths(paths) }
+            } else if (categories.isNotEmpty()) {
+                allQs.filter { it.category in categories }
+            } else {
+                allQs
+            }
+
+            val currentFlowMode = _quizFlowMode.value
+            val isShuffle = _shuffleQuestions.value
+
+            filtered = processQuestionPool(filtered, currentFlowMode, isShuffle, limit, offset)
+
+            val idsToFetch = filtered.map { it.id }
+            val indexMap = idsToFetch.withIndex().associate { it.value to it.index }
+            val fullQuestions = repository.getQuestionsByBookAndIds(targetBookId, idsToFetch).resolveHeaders()
+            if (isActive && _currentBookId.value == targetBookId) {
+                _quizQuestions.value = fullQuestions.sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+                activeQuizSessionId = System.currentTimeMillis()
+            }
+        }
+    }
+    
+    fun setQuizQuestionsByIds(bookId: String, ids: List<Long>) {
+        resetTransientQuizSessionState()
+        isLearnMode = false
+        isActiveQuizStandardSequence = false
+        activeQuizSourceTag = "Search"
+        currentExamSettings = null
+
+        _selectedTopic.value = null
+        _onlyBookmarks.value = false
+        quizGenJob?.cancel()
+        quizGenJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val indexMap = ids.withIndex().associate { it.value to it.index }
+            val fullQuestions = repository.getQuestionsByBookAndIds(bookId, ids).resolveHeaders()
+            if (isActive) {
+                _quizQuestions.value = fullQuestions.sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+            }
+        }
+    }
+
+    fun practiceWrongQuiz(historyId: Long?) {
+        resetTransientQuizSessionState()
+        isLearnMode = false
+        isActiveQuizStandardSequence = false
+        activeQuizSourceTag = "Review"
+        currentPracticeMistakesParentId = historyId
+        currentExamSettings = null
+
+        val entry = (if (historyId != null) {
+            history.value.find { it.historyId == historyId }
+                ?: _lastCompletedQuizResult.value?.takeIf { it.historyId == historyId }
+                ?: _lastCompletedQuizResult.value
+        } else {
+            _lastCompletedQuizResult.value ?: history.value.firstOrNull()
+        }) ?: return
+        val qIdsRaw = com.example.data.SharedGson.normal.fromJson(entry.questionIds, Array<Double>::class.java).map { it.toLong() }
+        val gson = com.example.data.SharedGson.normal
+        val rawList = gson.fromJson<List<Any?>>(entry.userAnswers, object : com.google.gson.reflect.TypeToken<List<Any?>>() {}.type)
+        val uAnsSets = rawList.map { item ->
+            when (item) {
+                is Number -> setOf(item.toInt())
+                is List<*> -> item.mapNotNull { (it as? Number)?.toInt() }.toSet()
+                else -> emptySet()
+            }
+        }
+
+        val displayedOptionsFromHistory: List<List<Int>> = try {
+            val trimmed = entry.activeQuizData.trim()
+            if (trimmed.startsWith("{")) {
+                val mapType = object : com.google.gson.reflect.TypeToken<Map<String, Any?>>() {}.type
+                val map: Map<String, Any?> = gson.fromJson(trimmed, mapType)
+                val rawDisp = map["displayedOptions"] as? List<*>
+                rawDisp?.map { row ->
+                    (row as? List<*>)?.mapNotNull { (it as? Number)?.toInt() } ?: emptyList()
+                } ?: emptyList()
+            } else emptyList()
+        } catch (_: Exception) { emptyList() }
+
+        val fallbackRetainedMap = settingsManager.getRetainedQuestionOptions(entry.bookId)
+        val retainedForWrongQuestions = mutableMapOf<Long, List<Int>>()
+
+        quizGenJob?.cancel()
+        quizGenJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val allQs = repository.getQuestionsByBookAndIds(entry.bookId, qIdsRaw).resolveHeaders().associateBy { it.id }
+            val wrongQIds = mutableListOf<Long>()
+
+            for (i in qIdsRaw.indices) {
+                val qId = qIdsRaw[i]
+                val ansSet = uAnsSets.getOrNull(i) ?: emptySet()
+                val q = allQs[qId]
+                if (q != null) {
+                    val allCorrect = q.resolveCorrectIndices(includeExtraOptions = true)
+                    val baseCorrect = q.resolveCorrectIndices(includeExtraOptions = false)
+                    val dispList = displayedOptionsFromHistory.getOrNull(i)?.takeIf { it.isNotEmpty() }
+                        ?: fallbackRetainedMap[qId]
+                    val dispSet = dispList?.toSet()
+                    val expectedCorrect = if (!dispSet.isNullOrEmpty()) {
+                        allCorrect.intersect(dispSet).ifEmpty { baseCorrect }
+                    } else {
+                        if (ansSet.any { it < 0 && it != com.example.data.TIMEOUT_SKIPPED_SENTINEL }) allCorrect else baseCorrect
+                    }
+                    if (ansSet.contains(com.example.data.TIMEOUT_SKIPPED_SENTINEL) || ansSet != expectedCorrect) {
+                        wrongQIds.add(qId)
+                        if (!dispList.isNullOrEmpty()) {
+                            retainedForWrongQuestions[qId] = dispList
+                        }
+                    }
+                }
+            }
+            activeRetainedOptionIndices = retainedForWrongQuestions
+            val indexMap = wrongQIds.withIndex().associate { it.value to it.index }
+            val fullQuestions = repository.getQuestionsByBookAndIds(entry.bookId, wrongQIds).resolveHeaders()
+            _selectedTopic.value = null
+            _onlyBookmarks.value = false
+            if (isActive) {
+                _quizQuestions.value = fullQuestions.sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+                activeQuizSessionId = System.currentTimeMillis()
+            }
+        }
+    }
+    
+    val allStats = _currentBookId.flatMapLatest { repository.getStatsForBook(it) }
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+        
+    val history = _currentBookId.flatMapLatest { bookId ->
+        repository.getHistoryForBook(bookId)
+    }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    fun deleteHistoryEntry(historyId: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.deleteHistoryEntry(historyId)
+        }
+    }
+
+    fun clearHistoryForCurrentBook() {
+        val bookId = _currentBookId.value
+        if (bookId.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.clearHistoryForBook(bookId)
+        }
+    }
+
+    fun cleanupExpiredHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                repository.cleanupOldHistory(30)
+            } catch (_: Exception) {}
+        }
+    }
+    
+    val bookmarks = _currentBookId.flatMapLatest { repository.getBookmarksForBook(it) }
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+        
+    val bookmarkedQuestions = kotlinx.coroutines.flow.combine(
+        _currentBookId.flatMapLatest { repository.getBookmarksForBook(it) },
+        _currentBookId.flatMapLatest { repository.getQuestionsForBook(it) }
+    ) { bks, allQs ->
+        val resolved = allQs.resolveHeaders()
+        val ids = bks.map { it.questionId }
+        resolved.filter { it.id in ids }
+    }.flowOn(kotlinx.coroutines.Dispatchers.Default).stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    
+    private val _selectedResultIdForReview = MutableStateFlow<Long?>(null)
+    val selectedResultIdForReview = _selectedResultIdForReview.asStateFlow()
+    
+    private val _reviewQuestions = MutableStateFlow<List<QuestionEntity>>(emptyList())
+    val reviewQuestions = _reviewQuestions.asStateFlow()
+    
+    fun selectResultForReview(id: Long?) {
+        _selectedResultIdForReview.value = id
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val entry = if (id != null) {
+                history.value.find { it.historyId == id }
+                    ?: _lastCompletedQuizResult.value?.takeIf { it.historyId == id }
+                    ?: _lastCompletedQuizResult.value
+            } else {
+                _lastCompletedQuizResult.value ?: history.value.firstOrNull()
+            }
+            if (entry != null) {
+                val qIdsRaw = com.example.data.SharedGson.normal.fromJson(entry.questionIds, Array<Double>::class.java).map { it.toLong() }
+                val indexMap = qIdsRaw.withIndex().associate { it.value to it.index }
+                val questions = repository.getQuestionsByBookAndIds(entry.bookId, qIdsRaw).resolveHeaders().sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+                _reviewQuestions.value = questions
+            }
+        }
+    }
+    
+    private val _themeState = MutableStateFlow(settingsManager.appTheme)
+    val themeState = _themeState.asStateFlow()
+
+    private val _isMatteModeState = kotlinx.coroutines.flow.MutableStateFlow(settingsManager.isMatteMode)
+    val isMatteModeState = _isMatteModeState.asStateFlow()
+
+    private val _themeModeState = kotlinx.coroutines.flow.MutableStateFlow(settingsManager.appThemeMode)
+    val themeModeState = _themeModeState.asStateFlow()
+
+    private val _timerSoundEnabledState = MutableStateFlow(settingsManager.timerSoundEnabled)
+    val timerSoundEnabledState = _timerSoundEnabledState.asStateFlow()
+
+    private val _clickSoundEnabledState = MutableStateFlow(settingsManager.clickSoundEnabled)
+    val clickSoundEnabledState = _clickSoundEnabledState.asStateFlow()
+
+    private val _hapticFeedbackEnabledState = MutableStateFlow(settingsManager.hapticFeedbackEnabled)
+    val hapticFeedbackEnabledState = _hapticFeedbackEnabledState.asStateFlow()
+
+    private val _appIconState = MutableStateFlow(settingsManager.appIcon)
+    val appIconState = _appIconState.asStateFlow()
+    
+    var currentPracticeMistakesParentId by androidx.compose.runtime.mutableStateOf<Long?>(null)
+
+    var activeCurrentIndex = 0
+    var activeQuizSessionId = 0L
+    var activeQTimes = mutableMapOf<Int, Long>()
+    var activeSelectedAnswers = mutableMapOf<Int, Set<Int>>()
+    var activeLockedAnswers = mutableMapOf<Int, Boolean>()
+    var activeTimeRemainingMs = -1L
+
+    fun saveActiveQuizState(
+        currentIndex: Int,
+        selectedAnswers: Map<Int, Set<Int>>,
+        lockedAnswers: Map<Int, Boolean>,
+        timeRemainingMs: Long,
+        qTimes: Map<Int, Long> = emptyMap(),
+        displayedOptions: Map<Long, List<Int>> = emptyMap()
+    ) {
+        if (activeQuizSourceTag != "Quiz" || isLearnMode || currentPracticeMistakesParentId != null) return
+        val mergedDisplayed = activeRetainedOptionIndices + displayedOptions
+        val state = mutableMapOf<String, Any>(
+            "bookId" to currentBookId.value,
+            "questions" to _quizQuestions.value.map { it.id },
+            "currentIndex" to currentIndex,
+            "selectedAnswers" to selectedAnswers,
+            "lockedAnswers" to lockedAnswers,
+            "timeRemainingMs" to timeRemainingMs,
+            "qTimes" to qTimes,
+            "sessionIdStr" to activeQuizSessionId.toString(),
+            "sourceTag" to activeQuizSourceTag,
+            "displayedOptions" to mergedDisplayed.entries.associate { (k, v) -> k.toString() to v },
+            "quizMode" to settingsManager.getQuizMode(currentBookId.value)
+        )
+        currentExamSettings?.let {
+            state["examSettingsJson"] = com.example.data.SharedGson.normal.toJson(it)
+        }
+        settingsManager.setActiveQuizState(currentBookId.value, com.example.data.SharedGson.normal.toJson(state))
+        _activeQuizTrigger.value++
+    }
+
+    fun clearActiveQuizState() {
+        settingsManager.setActiveQuizState(currentBookId.value, null)
+        _activeQuizTrigger.value++
+        activeCurrentIndex = 0
+        activeQTimes = mutableMapOf()
+        activeSelectedAnswers = mutableMapOf()
+        activeLockedAnswers = mutableMapOf()
+        activeTimeRemainingMs = -1L
+        activeQuizSessionId = System.currentTimeMillis()
+        activeRetainedOptionIndices = emptyMap()
+        currentExamSettings = null
+    }
+
+    suspend fun loadActiveQuizState(): Boolean {
+        pendingQuizGenerationTrigger = false
+        quizGenJob?.cancelAndJoin()
+        val stateStr = settingsManager.getActiveQuizState(currentBookId.value)
+        if (stateStr != null) {
+            try {
+                val type = object : com.google.gson.reflect.TypeToken<Map<String, Any>>() {}.type
+                val state: Map<String, Any> = com.example.data.SharedGson.normal.fromJson(stateStr, type)
+
+                val bookId = state["bookId"] as String
+
+                // Add validation to prevent loading orphaned states
+                val bookExists = books.value.any { it.id == bookId }
+
+                if (!bookExists) {
+                    clearActiveQuizState()
+                    return false
+                }
+
+                _currentBookId.value = bookId
+                activeQuizSourceTag = (state["sourceTag"] as? String) ?: "Quiz"
+
+                val qIdsRaw = (state["questions"] as? List<*>)?.mapNotNull { (it as? Number)?.toDouble() } ?: emptyList()
+                val qIds = qIdsRaw.map { it.toLong() }
+
+                val loadedQuestions = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                    val indexMap = qIds.withIndex().associate { it.value to it.index }
+                    val fullQuestions = repository.getQuestionsByBookAndIds(bookId, qIds).resolveHeaders()
+                    fullQuestions.sortedBy { indexMap[it.id] ?: Int.MAX_VALUE }
+                }
+                if (loadedQuestions.isEmpty()) {
+                    clearActiveQuizState()
+                    return false
+                }
+                _quizQuestions.value = loadedQuestions
+                isLearnMode = false
+                isActiveQuizStandardSequence = true
+                currentPracticeMistakesParentId = null
+
+                activeCurrentIndex = ((state["currentIndex"] as? Number)?.toInt() ?: 0)
+                    .coerceIn(0, (loadedQuestions.size - 1).coerceAtLeast(0))
+
+                val selAnsRaw = (state["selectedAnswers"] as? Map<*, *>) ?: emptyMap<Any, Any>()
+                activeSelectedAnswers = selAnsRaw.entries.mapNotNull { (k, v) ->
+                    val idxKey = k.toString().toIntOrNull() ?: return@mapNotNull null
+                    val ansSet = when (v) {
+                        is Number -> setOf(v.toInt())
+                        is List<*> -> v.mapNotNull { (it as? Number)?.toInt() }.toSet()
+                        else -> emptySet()
+                    }
+                    idxKey to ansSet
+                }.toMap().toMutableMap()
+
+                val lockAnsRaw = (state["lockedAnswers"] as? Map<*, *>) ?: emptyMap<Any, Any>()
+                activeLockedAnswers = lockAnsRaw.entries.mapNotNull { (k, v) ->
+                    val idxKey = k.toString().toIntOrNull() ?: return@mapNotNull null
+                    idxKey to (v as? Boolean ?: false)
+                }.toMap().toMutableMap()
+
+                val qTimesRaw = (state["qTimes"] as? Map<*, *>) ?: emptyMap<Any, Any>()
+                activeQTimes = qTimesRaw.entries.mapNotNull { (k, v) ->
+                    val idxKey = k.toString().toIntOrNull() ?: return@mapNotNull null
+                    val timeVal = (v as? Number)?.toLong() ?: return@mapNotNull null
+                    idxKey to timeVal
+                }.toMap().toMutableMap()
+
+                val dispMapRaw = (state["displayedOptions"] as? Map<*, *>) ?: emptyMap<Any, Any>()
+                activeRetainedOptionIndices = dispMapRaw.entries.mapNotNull { (k, v) ->
+                    val qId = k.toString().toLongOrNull()
+                    val indices = (v as? List<*>)?.mapNotNull { (it as? Number)?.toInt() }
+                    if (qId != null && !indices.isNullOrEmpty()) qId to indices else null
+                }.toMap()
+
+                activeTimeRemainingMs = (state["timeRemainingMs"] as? Number)?.toLong() ?: -1L
+                activeQuizSessionId = (state["sessionIdStr"] as? String)?.toLongOrNull()
+                    ?: (state["sessionId"] as? Number)?.toLong()
+                    ?: System.currentTimeMillis()
+                val savedQuizMode = (state["quizMode"] as? String) ?: settingsManager.getQuizMode(bookId)
+                val savedExamJson = state["examSettingsJson"] as? String
+                if (savedExamJson != null) {
+                    currentExamSettings = com.example.data.SharedGson.normal.fromJson(savedExamJson, ExamSettings::class.java)
+                } else if (savedQuizMode == "exam") {
+                    val limit = qIds.size
+                    val settingsStr = settingsManager.getExamSettings(bookId, limit)
+                    if (settingsStr != null) {
+                        currentExamSettings = com.example.data.SharedGson.normal.fromJson(settingsStr, ExamSettings::class.java)
+                    }
+                } else {
+                    currentExamSettings = null
+                }
+                return true
+            } catch (e: Exception) {
+                e.printStackTrace()
+                clearActiveQuizState()
+            }
+        }
+        return false
+    }
+
+    fun updateTheme(themeStr: String) {
+        settingsManager.appTheme = themeStr
+        _themeState.value = themeStr
+    }
+
+    fun updateIsMatteMode(isMatte: Boolean) {
+        settingsManager.isMatteMode = isMatte
+        _isMatteModeState.value = isMatte
+    }
+
+    fun updateThemeMode(modeStr: String) {
+        settingsManager.appThemeMode = modeStr
+        _themeModeState.value = modeStr
+    }
+
+    fun updateTimerSound(enabled: Boolean) {
+        settingsManager.timerSoundEnabled = enabled
+        _timerSoundEnabledState.value = enabled
+    }
+
+    fun updateClickSound(enabled: Boolean) {
+        settingsManager.clickSoundEnabled = enabled
+        _clickSoundEnabledState.value = enabled
+    }
+
+    fun updateHapticFeedback(enabled: Boolean) {
+        settingsManager.hapticFeedbackEnabled = enabled
+        _hapticFeedbackEnabledState.value = enabled
+    }
+
+    fun playButtonPress() {
+        if (_clickSoundEnabledState.value) soundHapticManager.playClick()
+        if (_hapticFeedbackEnabledState.value) soundHapticManager.hapticButtonPress()
+    }
+
+    fun playNavigation() {
+        if (_clickSoundEnabledState.value) soundHapticManager.playClick()
+        if (_hapticFeedbackEnabledState.value) soundHapticManager.hapticNavigation()
+    }
+
+    fun playToggle() {
+        if (_clickSoundEnabledState.value) soundHapticManager.playClick()
+        if (_hapticFeedbackEnabledState.value) soundHapticManager.hapticToggle()
+    }
+
+    fun playBookmark() {
+        if (_clickSoundEnabledState.value) soundHapticManager.playClick()
+        if (_hapticFeedbackEnabledState.value) soundHapticManager.hapticBookmark()
+    }
+
+    fun updateAppIcon(iconStr: String) {
+        settingsManager.appIcon = iconStr
+        _appIconState.value = iconStr
+    }
+    
+    private val _topicTreeRoot = MutableStateFlow<TopicNode?>(null)
+    val topicTreeRoot = _topicTreeRoot.asStateFlow()
+
+    private val _learningPlan = MutableStateFlow<LearningPlanEntity?>(null)
+    val learningPlan = _learningPlan.asStateFlow()
+
+    private val _favoriteTopics = MutableStateFlow(settingsManager.getFavoriteTopics(initialBookId))
+    val favoriteTopics = _favoriteTopics.asStateFlow()
+
+    fun toggleFavoriteTopic(path: String) {
+        val bookId = _currentBookId.value
+        val currentFavorites = settingsManager.getFavoriteTopics(bookId).toMutableSet()
+        if (currentFavorites.contains(path)) {
+            currentFavorites.remove(path)
+        } else {
+            currentFavorites.add(path)
+        }
+        settingsManager.setFavoriteTopics(bookId, currentFavorites)
+        _favoriteTopics.value = currentFavorites
+    }
+
+    private suspend fun calculateTopicTreeAsync(questions: List<com.example.data.QuestionSummary>, statsMap: Map<String, QuestionStatEntity>) {
+        val root = withContext(Dispatchers.Default) {
+            val rootNode = TopicNode("Root", "")
+            
+            questions.forEach { q ->
+                val stat = statsMap["${q.bookId}_${q.id}"]
+                
+                val rawPath = if (q.path.isNotBlank()) q.path else q.category
+                val delimiter = if (rawPath.contains(">")) ">" else if (rawPath.contains("/")) "/" else "-"
+                val parts = rawPath.split(delimiter).map { it.trim() }.filter { it.isNotBlank() }
+                
+                var current = rootNode
+                var currentPathStr = ""
+                
+                for (i in parts.indices) {
+                    val part = parts[i]
+                    currentPathStr = if (currentPathStr.isEmpty()) part else "$currentPathStr/$part"
+                    
+                    if (!current.children.containsKey(part)) {
+                        current.children[part] = TopicNode(part, currentPathStr)
+                    }
+                    current = current.children[part]!!
+                    
+                    current.questionCount++
+                    if (stat != null) {
+                        if (stat.attempts > 0) current.attemptedCount++
+                        current.correctCount += stat.correct
+                        current.totalAttempts += stat.attempts
+                    }
+                    
+                    current.questionIds.add(q.id)
+                    
+                    if (i == parts.size - 1) {
+                        current.isLeaf = true
+                    }
+                }
+            }
+            rootNode
+        }
+        _topicTreeRoot.value = root
+    }
+
+    private fun calculateTopicTree(questions: List<com.example.data.QuestionSummary>, statsMap: Map<String, QuestionStatEntity>) {
+        viewModelScope.launch {
+            calculateTopicTreeAsync(questions, statsMap)
+        }
+    }
+
+    fun toggleTopicCompleted(path: String) {
+        viewModelScope.launch {
+            val bookId = _currentBookId.value
+            val existing = _learningPlan.value
+            
+            val completedList = if (existing != null && existing.completedTopics.isNotBlank()) {
+                com.example.data.SharedGson.normal.fromJson(existing.completedTopics, Array<String>::class.java).toMutableList()
+            } else {
+                mutableListOf()
+            }
+            
+            if (completedList.contains(path)) {
+                completedList.remove(path)
+            } else {
+                completedList.add(path)
+            }
+            
+            val updatedJson = com.example.data.SharedGson.normal.toJson(completedList)
+            
+            if (existing != null) {
+                repository.insertLearningPlan(existing.copy(completedTopics = updatedJson))
+            } else {
+                repository.insertLearningPlan(
+                    LearningPlanEntity(
+                        bookId = bookId,
+                        topicOrder = "[]",
+                        unlockedTopics = "[]",
+                        lockedTopics = "[]",
+                        completedTopics = updatedJson
+                    )
+                )
+            }
+        }
+    }
+
+    init {
+        // Automatically delete quiz history entries older than 30 days to keep database storage lean
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                repository.cleanupOldHistory(30)
+            } catch (_: Exception) {}
+        }
+
+        // Load questions when book changes
+        viewModelScope.launch {
+            _currentBookId.flatMapLatest { repository.getQuestionSummariesForBook(it) }.collect { qList ->
+                _allBookQuestionSummaries.value = qList
+                if (pendingQuizGenerationTrigger) {
+                    pendingQuizGenerationTrigger = false
+                    generateQuizQuestions()
+                }
+            }
+        }
+        
+        viewModelScope.launch {
+            _currentBookId.flatMapLatest { repository.getLearningPlan(it) }.collect { plan ->
+                _learningPlan.value = plan
+            }
+        }
+        
+        viewModelScope.launch {
+            combine(_allBookQuestionSummaries, allStats) { questions, stats ->
+                if (questions.isNotEmpty()) {
+                    val statsMap = stats.associateBy { it.questionKey }
+                    calculateTopicTreeAsync(questions, statsMap)
+                }
+            }.collect()
+        }
+
+        viewModelScope.launch {
+            books.collect { bookList ->
+                if (bookList.isNotEmpty()) {
+                    val currentId = _currentBookId.value
+                    if (currentId.isEmpty() || bookList.none { it.id == currentId }) {
+                        val preferred = bookList.find { it.id == settingsManager.lastSelectedBookId } ?: bookList.first()
+                        selectBook(preferred.id)
+                    }
+                }
+            }
+        }
+    }
+
+    fun selectBook(bookId: String, forceRefresh: Boolean = false) {
+        val isDifferentBook = _currentBookId.value != bookId
+        if (isDifferentBook || forceRefresh) {
+            pendingQuizGenerationTrigger = true
+            if (isDifferentBook) {
+                _topicTreeRoot.value = null
+                _allBookQuestionSummaries.value = emptyList()
+            }
+            _currentBookId.value = bookId
+            settingsManager.lastSelectedBookId = bookId
+            
+            val paths = settingsManager.getSelectedPaths(bookId)
+            _selectedPaths.value = paths
+            
+            val categories = settingsManager.getSelectedCategories(bookId)
+            _selectedCategories.value = categories
+            
+            val limit = settingsManager.getQuestionLimit(bookId)
+            _questionLimit.value = if (limit == 0) null else limit
+            
+            _onlyBookmarks.value = false
+            _quizFlowMode.value = settingsManager.getQuizFlowMode(bookId)
+            _shuffleQuestions.value = settingsManager.getShuffleQuestions(bookId)
+            _sequenceOffset.value = settingsManager.getSequenceOffset(bookId)
+            _favoriteTopics.value = settingsManager.getFavoriteTopics(bookId)
+            _selectedTopic.value = null
+            isLearnMode = false
+            currentExamSettings = null
+            // Automatically repair any previously extracted questions that had $\n...$ or $...<strong>...$ corruption
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val existingQs = repository.getQuestionsForBookSync(bookId)
+                    val repairedQs = existingQs.mapNotNull { q ->
+                        val fixed = com.example.ui.components.sanitizeCorruptedQuestionEntity(q)
+                        if (fixed != q) fixed else null
+                    }
+                    if (repairedQs.isNotEmpty()) {
+                        repository.insertQuestions(repairedQs)
+                    }
+                } catch (_: Exception) {}
+            }
+
+            generateQuizQuestions()
+            if (lastSearchQuery.isNotBlank()) {
+                searchQuestions(lastSearchQuery)
+            }
+        }
+    }
+
+    fun toggleBookFavorite(bookId: String, isFavorite: Boolean) {
+        viewModelScope.launch {
+            repository.toggleBookFavorite(bookId, isFavorite)
+        }
+    }
+    
+    fun toggleCategory(category: String) {
+        val current = _selectedCategories.value.toMutableSet()
+        if (current.contains(category)) current.remove(category)
+        else current.add(category)
+        _selectedCategories.value = current
+        settingsManager.setSelectedCategories(_currentBookId.value, current)
+        generateQuizQuestions()
+    }
+    
+    fun setQuestionLimit(limit: Int?) {
+        _questionLimit.value = limit
+        settingsManager.setQuestionLimit(_currentBookId.value, limit ?: 0)
+        generateQuizQuestions()
+    }
+
+    fun saveQuizResult(
+        bookId: String,
+        quizLabel: String,
+        score: Float,
+        total: Int,
+        correct: Int,
+        wrong: Int,
+        skipped: Int,
+        timeUsed: Long,
+        questionIds: List<Long>,
+        userAnswers: List<Set<Int>?>,
+        questionTimes: List<Long> = emptyList(),
+        displayedOptionIndices: List<List<Int>> = emptyList()
+    ) {
+        val parentId = currentPracticeMistakesParentId
+        currentPracticeMistakesParentId = null
+        val sourceTag = when {
+            parentId != null -> "Review"
+            isLearnMode -> "Learn"
+            activeQuizSourceTag in setOf("Quiz", "Learn", "Search", "Bookmarks", "Review", "Revision") -> activeQuizSourceTag
+            else -> "Quiz"
+        }
+        val shouldPersistInHistory = parentId == null && sourceTag in setOf("Quiz", "Learn", "Search")
+
+        val gson = com.example.data.SharedGson.normal
+        val activeQuizMetadataJson = gson.toJson(
+            mapOf(
+                "times" to questionTimes,
+                "displayedOptions" to displayedOptionIndices,
+                "sourceTag" to sourceTag
+            )
+        )
+
+        val historyEntry = QuizHistoryEntity(
+            historyId = System.currentTimeMillis(),
+            bookId = bookId,
+            date = java.text.SimpleDateFormat.getDateTimeInstance().format(java.util.Date()),
+            status = if (shouldPersistInHistory) "completed|$sourceTag" else "transient|$sourceTag",
+            quizLabel = quizLabel,
+            total = total,
+            correct = correct,
+            wrong = wrong,
+            skipped = skipped,
+            accuracy = if (total > 0) (correct.toFloat() / total) * 100f else 0f,
+            rawScore = score,
+            finalScore = score,
+            timeUsed = timeUsed,
+            activeQuizData = activeQuizMetadataJson,
+            questionIds = gson.toJson(questionIds),
+            userAnswers = gson.toJson(userAnswers)
+        )
+        // Store in memory immediately so ResultScreen and ReviewScreen always have the latest completed session
+        _lastCompletedQuizResult.value = historyEntry
+        _selectedResultIdForReview.value = historyEntry.historyId
+
+        // Persist the 4 displayed options per question for this book so Review / Revision / Practice Mistakes
+        // always retain those exact 4 options
+        if (displayedOptionIndices.isNotEmpty() && questionIds.size == displayedOptionIndices.size) {
+            val newOptionMappings = questionIds.indices.mapNotNull { idx ->
+                val disp = displayedOptionIndices[idx]
+                if (disp.isNotEmpty()) questionIds[idx] to disp else null
+            }.toMap()
+            settingsManager.saveRetainedQuestionOptions(bookId, newOptionMappings)
+        }
+
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            // Requirement 3: Only save Quiz (Home), Learn, and Search quizzes to persistent Quiz History
+            if (shouldPersistInHistory) {
+                repository.insertHistory(historyEntry)
+            }
+
+            // Update question stats (including when remediating in Practice Mistakes mode
+            // so answered mistakes can advance their streak and graduate once mastered)
+            val now = System.currentTimeMillis()
+            val hourMs = 3_600_000L
+            val dayMs = 86_400_000L
+            val fullQuestions = repository.getQuestionsByBookAndIds(bookId, questionIds).resolveHeaders().associateBy { it.id }
+
+            questionIds.forEachIndexed { index, qId ->
+                val ans = userAnswers.getOrNull(index)
+                if (ans != null && !ans.contains(com.example.data.TIMEOUT_SKIPPED_SENTINEL)) {
+                    val key = "${bookId}_${qId}"
+                    val existing = allStats.value.find { it.questionKey == key }
+                        ?: QuestionStatEntity(questionKey = key, bookId = bookId, questionId = qId)
+
+                    val currentQ = fullQuestions[qId]
+                    val isCorrect = if (currentQ != null) {
+                        val allCorrect = currentQ.resolveCorrectIndices(includeExtraOptions = true)
+                        val baseCorrect = currentQ.resolveCorrectIndices(includeExtraOptions = false)
+                        val dispForQ = displayedOptionIndices.getOrNull(index)?.toSet()
+                        val expectedCorrect = if (!dispForQ.isNullOrEmpty()) {
+                            allCorrect.intersect(dispForQ).ifEmpty { baseCorrect }
+                        } else {
+                            if (ans.any { it < 0 }) allCorrect else baseCorrect
+                        }
+                        ans == expectedCorrect
+                    } else false
+
+                    val q = if (isCorrect) 4 else 1
+                    val newEase = (existing.easeFactor + (0.1f - (5 - q) * (0.08f + (5 - q) * 0.02f)))
+                        .coerceIn(1.3f, 3.0f)
+
+                    val newStreak = if (isCorrect) existing.streak + 1 else 0
+                    val updatedWrongCount = if (isCorrect) existing.wrong else existing.wrong + 1
+
+                    val newIntervalDays = when (newStreak) {
+                        0 -> 1
+                        1 -> 1
+                        2 -> 3
+                        3 -> 7
+                        else -> kotlin.math.round(existing.interval * newEase).toInt()
+                            .coerceIn(existing.interval + 1, 180)
+                    }
+
+                    // Hybrid Intra-Day + Multi-Day Next Review Timestamp:
+                    // - Wrong (streak == 0): due in 10 minutes (active remediation in upcoming quizzes)
+                    // - 1st Correct after mistake (streak == 1, wrong > 0): due in 4 hours (same-day confirmation)
+                    // - 1st Correct on clean question (streak == 1, wrong == 0): due in 12 hours
+                    // - 2nd+ Consecutive Correct (streak >= 2): multi-day spaced repetition (3d -> 7d -> exponentially expanding)
+                    val newNextReview = when (newStreak) {
+                        0 -> now + (10L * 60_000L)
+                        1 -> if (updatedWrongCount > 0) now + (4L * hourMs) else now + (12L * hourMs)
+                        else -> now + (newIntervalDays * dayMs)
+                    }
+
+                    val updated = existing.copy(
+                        attempts = existing.attempts + 1,
+                        correct = if (isCorrect) existing.correct + 1 else existing.correct,
+                        wrong = updatedWrongCount,
+                        lastSeen = now,
+                        easeFactor = newEase,
+                        streak = newStreak,
+                        interval = newIntervalDays,
+                        nextReview = newNextReview
+                    )
+                    repository.insertStat(updated)
+                }
+            }
+
+            // Advance sequence if autoSequence is on, but ONLY if not practice mistakes and not Learn Mode
+            if (isActiveQuizStandardSequence && !isLearnMode && parentId == null &&
+                settingsManager.getAutoSequence(bookId) && settingsManager.getQuizFlowMode(bookId) == "sequence"
+            ) {
+                val limit = _questionLimit.value
+                val offset = _sequenceOffset.value
+                if (limit != null) {
+                    val nextOffset = offset + limit
+                    val maxValue = _allBookQuestionSummaries.value.size
+                    val updatedOffset = if (nextOffset <= maxValue) nextOffset else 1
+                    _sequenceOffset.value = updatedOffset
+                    settingsManager.setSequenceOffset(bookId, updatedOffset)
+                }
+            }
+
+            // Refresh the next quiz question pool so returning to HomeScreen reflects updated stats immediately
+            if (isActiveQuizStandardSequence) {
+                generateQuizQuestions()
+            }
+        }
+    }
+
+    fun toggleBookmark(bookId: String, questionId: Long) {
+        if (_hapticFeedbackEnabledState.value) soundHapticManager.hapticBookmark()
+        if (_clickSoundEnabledState.value) soundHapticManager.playClick()
+        viewModelScope.launch {
+            val key = "${bookId}_${questionId}"
+            val exists = bookmarks.value.any { it.bookmarkKey == key }
+            if (exists) {
+                repository.removeBookmark(bookId, questionId)
+            } else {
+                repository.addBookmark(bookId, questionId)
+            }
+        }
+    }
+
+    
+    fun confirmFix(context: android.content.Context) {
+        val uri = pendingBookUri ?: return
+        pendingBookUri = null
+        _fixRequiredMessage.value = null
+        addCustomBook(context, uri, true)
+    }
+    
+    fun cancelFix() {
+        pendingBookUri = null
+        _fixRequiredMessage.value = null
+        _verificationStatus.value = "error"
+        _verificationMessage.value = "Import cancelled due to syntax errors."
+    }
+
+    private fun clearBookRuntimeCaches(context: android.content.Context, bookId: String) {
+        val contextIds = listOf(bookId, "${bookId}_read", "${bookId}_edit")
+        for (cid in contextIds) {
+            activeAiTasks.remove(cid)
+            cancelNotification(context, cid.hashCode())
+            aiProcessingJobs[cid]?.cancel()
+            aiProcessingJobs.remove(cid)
+        }
+        _chatHistory.value = _chatHistory.value.toMutableMap().apply { contextIds.forEach { remove(it) } }
+        _pendingUpdates.value = _pendingUpdates.value.toMutableMap().apply { contextIds.forEach { remove(it) } }
+        _sessionAttachments.value = _sessionAttachments.value.toMutableMap().apply { contextIds.forEach { remove(it) } }
+        _aiPromptTexts.value = _aiPromptTexts.value.toMutableMap().apply { contextIds.forEach { remove(it) } }
+        _aiProcessingStatus.value = _aiProcessingStatus.value.toMutableMap().apply { contextIds.forEach { remove(it) } }
+        _aiProcessingProgress.value = _aiProcessingProgress.value.toMutableMap().apply { contextIds.forEach { remove(it) } }
+
+        com.example.ui.components.MathFormattingCache.clearCache()
+        com.example.ui.components.LatexDrawableCache.clearCache()
+    }
+
+    private suspend fun purgeBookDataAndCaches(context: android.content.Context, bookId: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                val basePath = android.os.Environment.getExternalStorageDirectory().absolutePath
+                val quizerDir = java.io.File(basePath, "Quizer")
+                val bookDir = java.io.File(quizerDir, bookId)
+                val trashDir = java.io.File(quizerDir, ".trash")
+
+                if (!trashDir.exists()) trashDir.mkdirs()
+                val dateFormat = java.text.SimpleDateFormat("yy.MM.dd_HH.mm.ss", java.util.Locale.getDefault())
+                val timestamp = dateFormat.format(java.util.Date())
+
+                val possibleFiles = quizerDir.listFiles { file ->
+                    file.isFile && (file.name.endsWith(".qbook", ignoreCase = true) || file.name.endsWith(".js", ignoreCase = true))
+                } ?: emptyArray()
+
+                for (pf in possibleFiles) {
+                    var match = false
+                    if (pf.name.endsWith(".qbook", ignoreCase = true)) {
+                        try {
+                            java.util.zip.ZipFile(pf).use { zip ->
+                                val metaEntry = zip.getEntry("book_meta.json")
+                                if (metaEntry != null) {
+                                    val reader = zip.getInputStream(metaEntry).bufferedReader()
+                                    val jsonStr = com.example.data.DataParser.autoFixJson(reader.readText())
+                                    val meta = com.example.data.SharedGson.lenient.fromJson(jsonStr, com.example.data.QBookMeta::class.java)
+                                    if (meta?.id == bookId) match = true
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    } else if (pf.nameWithoutExtension == bookId) {
+                        match = true
+                    }
+
+                    if (match) {
+                        pf.copyTo(java.io.File(trashDir, "${timestamp}_${pf.name}"), overwrite = true)
+                        pf.delete()
+                    }
+                }
+
+                // Permanently delete extracted book folder (images, backup_questions.json), RestorePoints, and Updates
+                if (bookDir.exists()) {
+                    bookDir.deleteRecursively()
+                }
+                val restoreDir = java.io.File(quizerDir, "RestorePoints/$bookId")
+                if (restoreDir.exists()) {
+                    restoreDir.deleteRecursively()
+                }
+                val updatesDir = java.io.File(quizerDir, "Updates")
+                if (updatesDir.exists()) {
+                    updatesDir.listFiles { f -> f.name.startsWith("${bookId}_") }?.forEach { it.delete() }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            repository.deleteBook(bookId)
+            repository.deleteQuestionsForBook(bookId)
+            repository.deleteAssociatedDataForBook(bookId)
+            settingsManager.clearBookSettings(bookId)
+        }
+
+        clearBookRuntimeCaches(context, bookId)
+        _activeQuizTrigger.value++
+    }
+
+    fun deleteBook(context: android.content.Context, bookId: String) {
+        viewModelScope.launch {
+            val updatedRemoved = settingsManager.removedBooks.toMutableSet()
+            updatedRemoved.add(bookId)
+            settingsManager.removedBooks = updatedRemoved
+
+            purgeBookDataAndCaches(context, bookId)
+
+            if (currentBookId.value == bookId) {
+                val newBooks = withContext(Dispatchers.IO) { repository.getAllBooksSync() }
+                if (newBooks.isNotEmpty()) {
+                    selectBook(newBooks.first().id, forceRefresh = true)
+                } else {
+                    _currentBookId.value = ""
+                    settingsManager.lastSelectedBookId = ""
+                    _allBookQuestionSummaries.value = emptyList()
+                    _topicTreeRoot.value = null
+                    _selectedPaths.value = emptySet()
+                    _selectedCategories.value = emptySet()
+                    _questionLimit.value = null
+                    _favoriteTopics.value = emptySet()
+                    currentExamSettings = null
+                    generateQuizQuestions()
+                }
+            }
+        }
+    }
+
+    fun replaceBook(context: android.content.Context, bookId: String, uri: android.net.Uri) {
+        viewModelScope.launch {
+            purgeBookDataAndCaches(context, bookId)
+            _currentBookId.value = bookId
+            addCustomBook(context, uri)
+        }
+    }
+
+    private val _searchResults = MutableStateFlow<List<QuestionEntity>>(emptyList())
+    val searchResults = _searchResults.asStateFlow()
+    private var lastSearchQuery = ""
+
+    fun searchQuestions(query: String) {
+        lastSearchQuery = query
+        viewModelScope.launch(Dispatchers.IO) {
+            val bookId = _currentBookId.value
+            if (query.trim().isBlank()) {
+                _searchResults.value = emptyList()
+            } else {
+                val matched = repository.searchQuestionsSync(bookId, query).resolveHeaders()
+                _searchResults.value = matched
+            }
+        }
+    }
+
+    fun resetApp(context: android.content.Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.clearDatabase()
+            withContext(Dispatchers.Main) {
+                settingsManager.clearAll()
+                com.example.data.SecurePrefs.get(context).edit().clear().apply()
+                _themeState.value = settingsManager.appTheme
+                _currentBookId.value = ""
+                _allBookQuestionSummaries.value = emptyList()
+                _topicTreeRoot.value = null
+                
+                // Re-initialize default data
+                DataParser.loadInitialData(context, repository)
+                
+                val newBooks = repository.getAllBooksSync()
+                if (newBooks.isNotEmpty()) {
+                    selectBook(newBooks.first().id)
+                }
+            }
+        }
+    }
+
+    fun resetBookToInitial(context: android.content.Context, bookId: String, onComplete: (Boolean) -> Unit) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val quizerDir = java.io.File(android.os.Environment.getExternalStorageDirectory(), "Quizer")
+                val bookDir = java.io.File(quizerDir, bookId)
+                val backupFile = java.io.File(bookDir, "backup_questions.json")
+                if (backupFile.exists()) {
+                    val fileContent = backupFile.readText()
+                    val type = object : com.google.gson.reflect.TypeToken<List<com.example.data.QBookQuestion>>() {}.type
+                    val questions: List<com.example.data.QBookQuestion> = com.example.data.SharedGson.normal.fromJson(fileContent, type)
+                    
+                    val book = repository.getBookSync(bookId)
+                    if (book != null) {
+                        // Only replace the book's questions; do NOT call repository.deleteBook(bookId)
+                        // because deleteBook wipes out all user stats, quiz history, and bookmarks!
+                        repository.deleteQuestionsForBook(bookId)
+                        repository.insertBook(book)
+
+                        val gsonForExport = com.example.data.SharedGson.normal
+                        val entities = questions.map { q ->
+                            val normalizedCorrectIds = com.example.data.normalizeCorrectOptionIdsList(q.correctOptionIds)
+                            val advancedOptionsStr = gsonForExport.toJson(q.options)
+                            val advancedCorrectIdsStr = gsonForExport.toJson(normalizedCorrectIds)
+                            val legacyOptions = q.options.map { it.text }
+                            val legacyOptionsStr = gsonForExport.toJson(legacyOptions)
+                            val legacyExtraOptions = q.extraOptions?.map { it.text } ?: emptyList()
+                            val legacyExtraOptionsStr = gsonForExport.toJson(legacyExtraOptions)
+                            val legacyCorrectIndex = if (normalizedCorrectIds.isNotEmpty()) {
+                                val firstBase = normalizedCorrectIds.firstNotNullOfOrNull { cid ->
+                                    q.options.indexOfFirst { it.id.equals(cid, ignoreCase = true) }.takeIf { it != -1 }
+                                }
+                                firstBase ?: 0
+                            } else 0
+                            val isMulti = (q.multipleCorrect == true) || (normalizedCorrectIds.size > 1)
+                            
+                            com.example.data.QuestionEntity(
+                                id = q.id,
+                                bookId = book.id,
+                                question = q.question.text,
+                                options = legacyOptionsStr,
+                                correctIndex = legacyCorrectIndex,
+                                explanation = q.explanation?.brief ?: "",
+                                path = q.metadata.path,
+                                category = q.metadata.category,
+                                section = q.metadata.path,
+                                extraOptions = legacyExtraOptionsStr,
+                                exam = q.metadata.exam ?: "",
+                                year = q.metadata.year?.toString() ?: "",
+                                img = q.question.image,
+                                questionHeader = q.header?.text,
+                                advancedOptions = advancedOptionsStr,
+                                advancedCorrectIds = advancedCorrectIdsStr,
+                                detailedExplanation = q.explanation?.detailed,
+                                explanationImage = q.explanation?.image,
+                                multipleCorrect = isMulti,
+                                exams = q.metadata.exams?.let { gsonForExport.toJson(it) },
+                                explanationTable = q.explanation?.table?.let { gsonForExport.toJson(it) },
+                                format = q.question.format,
+                                tableData = q.question.table?.let { gsonForExport.toJson(it) },
+                                bottomText = q.question.bottomText
+                            )
+                        }
+                        repository.insertQuestions(entities)
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            onComplete(true)
+                            selectBook(bookId) 
+                        }
+                    } else {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { onComplete(false) }
+                    }
+                } else {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { onComplete(false) }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { onComplete(false) }
+            }
+        }
+    }
+    
+        override fun onCleared() {
+        super.onCleared()
+        soundHapticManager.release()
+    }
+}
+
+
+@androidx.annotation.Keep
+data class ExamSettings(
+    val markingScheme: String = "Off",
+    val customCorrectMarks: Float = 1f,
+    val customWrongMarks: Float = 0f,
+    val timerPreset: String = "Off",
+    val customTimerMinutes: Int = 0,
+    val seriousMode: Boolean = false
+)
