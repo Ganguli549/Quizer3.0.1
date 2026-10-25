@@ -42,8 +42,10 @@ fun ReviewScreen(viewModel: MainViewModel, onHome: () -> Unit) {
     val allQuestions by viewModel.reviewQuestions.collectAsState()
     val selectedId by viewModel.selectedResultIdForReview.collectAsState()
 
+    val practiceMistakesMap by viewModel.practiceMistakesResults.collectAsState()
     val lastResult = if (selectedId != null) {
         history.find { it.historyId == selectedId }
+            ?: practiceMistakesMap.values.find { it.historyId == selectedId }
             ?: lastCompleted?.takeIf { it.historyId == selectedId }
             ?: lastCompleted
             ?: history.firstOrNull()

@@ -160,6 +160,12 @@ fun AppNavigation(viewModel: MainViewModel) {
                     navController.navigate(QuizRoute) {
                         launchSingleTop = true
                     }
+                },
+                onNextBatch = {
+                    navController.navigate(QuizRoute) {
+                        popUpTo(ResultsRoute) { inclusive = true }
+                        launchSingleTop = true
+                    }
                 }
             )
         }

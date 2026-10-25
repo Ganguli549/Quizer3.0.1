@@ -128,6 +128,50 @@ class QuizRepository(context: Context) {
         db.statDao().insertStat(stat)
     }
 
+    suspend fun getStatsForBookSync(bookId: String): List<QuestionStatEntity> {
+        return db.statDao().getStatsForBookSync(bookId)
+    }
+
+    suspend fun remapQuestionIdsForBook(bookId: String, idMapping: Map<Long, Long>) {
+        if (idMapping.isEmpty()) return
+        val hasChanges = idMapping.any { (oldId, newId) -> oldId != newId }
+        if (!hasChanges) return
+
+        val existingStats = db.statDao().getStatsForBookSync(bookId)
+        if (existingStats.isNotEmpty()) {
+            val updatedStats = existingStats.map { st ->
+                val newId = idMapping[st.questionId]
+                if (newId != null && newId != st.questionId) {
+                    st.copy(
+                        questionKey = "${bookId}_${newId}",
+                        questionId = newId
+                    )
+                } else st
+            }
+            db.statDao().deleteStatsForBook(bookId)
+            for (st in updatedStats) {
+                db.statDao().insertStat(st)
+            }
+        }
+
+        val existingBookmarks = db.bookmarkDao().getBookmarksForBookSync(bookId)
+        if (existingBookmarks.isNotEmpty()) {
+            val updatedBookmarks = existingBookmarks.map { bm ->
+                val newId = idMapping[bm.questionId]
+                if (newId != null && newId != bm.questionId) {
+                    bm.copy(
+                        bookmarkKey = "${bookId}_${newId}",
+                        questionId = newId
+                    )
+                } else bm
+            }
+            db.bookmarkDao().deleteBookmarksForBook(bookId)
+            for (bm in updatedBookmarks) {
+                db.bookmarkDao().insertBookmark(bm)
+            }
+        }
+    }
+
     suspend fun insertHistory(historyEntry: QuizHistoryEntity) {
         // Automatically prune quiz history older than 30 days on every new history insert to save storage
         val thirtyDaysAgo = System.currentTimeMillis() - (30L * 24L * 60L * 60L * 1000L)

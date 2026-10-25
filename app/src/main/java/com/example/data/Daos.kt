@@ -74,6 +74,9 @@ interface QuizStatDao {
     @Query("SELECT * FROM question_stats WHERE bookId = :bookId")
     fun getStatsForBook(bookId: String): Flow<List<QuestionStatEntity>>
 
+    @Query("SELECT * FROM question_stats WHERE bookId = :bookId")
+    suspend fun getStatsForBookSync(bookId: String): List<QuestionStatEntity>
+
     @Query("SELECT * FROM question_stats")
     fun getAllStats(): Flow<List<QuestionStatEntity>>
 
@@ -109,6 +112,9 @@ interface HistoryDao {
 interface BookmarkDao {
     @Query("SELECT * FROM bookmarks WHERE bookId = :bookId")
     fun getBookmarksForBook(bookId: String): Flow<List<BookmarkEntity>>
+
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId")
+    suspend fun getBookmarksForBookSync(bookId: String): List<BookmarkEntity>
 
     @Query("SELECT q.* FROM questions q INNER JOIN bookmarks b ON q.id = b.questionId AND q.bookId = b.bookId WHERE b.bookId = :bookId")
     fun getBookmarkedQuestionsForBook(bookId: String): Flow<List<QuestionEntity>>

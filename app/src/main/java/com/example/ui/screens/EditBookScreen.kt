@@ -80,6 +80,7 @@ fun EditBookScreen(
     var showBulkHeaderDialog by remember { mutableStateOf(false) }
     var showBulkPathDialog by remember { mutableStateOf(false) }
     var showBulkCategoryDialog by remember { mutableStateOf(false) }
+    var showShuffleDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     var showMenu by remember { mutableStateOf(false) }
     var showAiAssistant by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
@@ -267,7 +268,14 @@ fun EditBookScreen(
                                     showBulkCategoryDialog = true
                                 }
                             )
-                                                        DropdownMenuItem(
+                            DropdownMenuItem(
+                                text = { Text("Shuffle") },
+                                onClick = {
+                                    showMenu = false
+                                    showShuffleDialog = true
+                                }
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Export") },
                                 onClick = {
                                     showMenu = false
@@ -551,6 +559,51 @@ fun EditBookScreen(
                             autoSaveBook("Applied bulk category")
                         }
                         showBulkCategoryDialog = false
+                    }
+                }
+            )
+        }
+
+        if (showShuffleDialog) {
+            ShuffleBookDialog(
+                questions = questions,
+                onDismiss = { showShuffleDialog = false },
+                onShuffleOptions = { startId, endId ->
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val sorted = questions.sortedBy { it.id }
+                        val minId = minOf(startId, endId)
+                        val maxId = maxOf(startId, endId)
+                        val targetQuestions = sorted.filter { it.id in minId..maxId }
+                        val updatedList = targetQuestions.mapNotNull { q ->
+                            shuffleSingleQuestionOptions(q)
+                        }
+                        if (updatedList.isNotEmpty()) {
+                            viewModel.repository.insertQuestions(updatedList)
+                            loadQuestions()
+                            hasGlobalUnsavedChanges = true
+                            autoSaveBook("Shuffled options (Q$minId-Q$maxId)")
+                            snackbarHostState.showSnackbar("Shuffled options for ${updatedList.size} questions (Q$minId–Q$maxId)")
+                        } else {
+                            snackbarHostState.showSnackbar("No questions with 2+ options found in Q$minId–Q$maxId")
+                        }
+                        showShuffleDialog = false
+                    }
+                },
+                onShuffleQuestionsInTopics = { selectedTopics ->
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val sorted = questions.sortedBy { it.id }
+                        val (updatedEntities, idMapping, shuffledCount) = shuffleQuestionsWithinTopics(sorted, selectedTopics)
+                        if (updatedEntities.isNotEmpty() && shuffledCount > 0) {
+                            viewModel.repository.insertQuestions(updatedEntities)
+                            viewModel.repository.remapQuestionIdsForBook(currentBookId, idMapping)
+                            loadQuestions()
+                            hasGlobalUnsavedChanges = true
+                            autoSaveBook("Shuffled questions in ${selectedTopics.size} topic(s)")
+                            snackbarHostState.showSnackbar("Shuffled $shuffledCount questions across ${selectedTopics.size} topic(s)")
+                        } else {
+                            snackbarHostState.showSnackbar("Need at least 2 questions in the selected topic(s) to shuffle")
+                        }
+                        showShuffleDialog = false
                     }
                 }
             )
@@ -1829,3 +1882,492 @@ fun BulkPathDialog(
         }
     )
 }
+
+private fun extractQuestionTopicLabel(q: QuestionEntity): String {
+    return q.path.trim().ifBlank { q.category.trim().ifBlank { "General" } }
+}
+
+private fun shuffleSingleQuestionOptions(q: QuestionEntity): QuestionEntity? {
+    val gson = com.example.data.SharedGson.normal
+    val optType = object : com.google.gson.reflect.TypeToken<List<com.example.data.QBookOption>>() {}.type
+    val strListType = object : com.google.gson.reflect.TypeToken<List<String>>() {}.type
+
+    val parsedAdv: List<com.example.data.QBookOption>? = try {
+        gson.fromJson<List<com.example.data.QBookOption>>(q.advancedOptions ?: "[]", optType)
+    } catch (_: Exception) { null }
+
+    val baseTexts: List<String> = if (!parsedAdv.isNullOrEmpty()) {
+        parsedAdv.map { it.text }
+    } else {
+        try {
+            gson.fromJson<List<String>>(q.options, strListType) ?: emptyList()
+        } catch (_: Exception) { emptyList() }
+    }
+
+    if (baseTexts.size < 2) return null
+
+    val baseCorrectIndices = q.resolveCorrectIndices(includeExtraOptions = false)
+        .filter { it in baseTexts.indices }
+        .toSet()
+
+    val preservedExtraCorrectIds: List<String> = try {
+        val rawIds: List<String> = gson.fromJson<List<String>>(q.advancedCorrectIds ?: "[]", strListType) ?: emptyList()
+        rawIds.map { it.trim() }.filter { it.startsWith("ext", ignoreCase = true) }
+    } catch (_: Exception) { emptyList() }
+
+    val originalOrder = baseTexts.indices.toList()
+    var perm = originalOrder.shuffled()
+    if (perm == originalOrder && baseTexts.size > 1) {
+        // Guarantee an actual permutation so single-question shuffles always visibly reorder options
+        perm = originalOrder.drop(1) + originalOrder.first()
+    }
+
+    val newOptions = perm.map { oldIdx -> baseTexts[oldIdx] }
+    val oldToNew = IntArray(baseTexts.size)
+    for (newIdx in perm.indices) {
+        oldToNew[perm[newIdx]] = newIdx
+    }
+
+    val newBaseCorrectIndices = baseCorrectIndices
+        .mapNotNull { oldIdx -> if (oldIdx in baseTexts.indices) oldToNew[oldIdx] else null }
+        .sorted()
+
+    val primaryCorrectIndex = newBaseCorrectIndices.firstOrNull() ?: 0
+    val newAdvOptions = newOptions.mapIndexed { idx, txt ->
+        com.example.data.QBookOption(id = "opt$idx", text = txt)
+    }
+    val newCorrectIds = (newBaseCorrectIndices.map { "opt$it" } + preservedExtraCorrectIds)
+        .distinct()
+        .ifEmpty { listOf("opt$primaryCorrectIndex") }
+
+    return q.copy(
+        options = gson.toJson(newOptions),
+        correctIndex = primaryCorrectIndex,
+        advancedOptions = gson.toJson(newAdvOptions),
+        advancedCorrectIds = gson.toJson(newCorrectIds)
+    )
+}
+
+private data class QuestionShuffleGroup(
+    val questions: List<QuestionEntity>,
+    val headerText: String?
+)
+
+private fun shuffleQuestionsWithinTopics(
+    sortedQuestions: List<QuestionEntity>,
+    selectedTopics: Set<String>
+): Triple<List<QuestionEntity>, Map<Long, Long>, Int> {
+    if (sortedQuestions.isEmpty() || selectedTopics.isEmpty()) {
+        return Triple(emptyList(), emptyMap(), 0)
+    }
+    val gson = com.example.data.SharedGson.normal
+    val updatedBySlot = sortedQuestions.toMutableList()
+    val idMapping = mutableMapOf<Long, Long>()
+    var totalShuffledQuestions = 0
+
+    for (topic in selectedTopics) {
+        val indicesInTopic = sortedQuestions.indices.filter { idx ->
+            extractQuestionTopicLabel(sortedQuestions[idx]) == topic
+        }
+        if (indicesInTopic.size < 2) continue
+
+        val topicQuestions = indicesInTopic.map { sortedQuestions[it] }
+        val targetSlotIds = topicQuestions.map { it.id }
+
+        // Group contiguous questions that share a multi-question header or <p> passage continuation
+        // so reading comprehension blocks stay intact when shuffled
+        val groups = mutableListOf<QuestionShuffleGroup>()
+        var i = 0
+        while (i < topicQuestions.size) {
+            val q = topicQuestions[i]
+            val parsedHeader = try {
+                val raw = q.questionHeader?.trim()
+                if (!raw.isNullOrEmpty() && raw.startsWith("{")) {
+                    gson.fromJson(raw, com.example.data.QBookHeader::class.java)
+                } else null
+            } catch (_: Exception) { null }
+
+            if (parsedHeader != null && parsedHeader.endId > parsedHeader.startId) {
+                val groupList = mutableListOf(q)
+                var j = i + 1
+                while (j < topicQuestions.size && topicQuestions[j].id in parsedHeader.startId..parsedHeader.endId) {
+                    groupList.add(topicQuestions[j])
+                    j++
+                }
+                groups.add(QuestionShuffleGroup(groupList, parsedHeader.text))
+                i = j
+            } else {
+                val groupList = mutableListOf(q)
+                var j = i + 1
+                while (j < topicQuestions.size && topicQuestions[j].question.trimStart().startsWith("<p>", ignoreCase = true)) {
+                    groupList.add(topicQuestions[j])
+                    j++
+                }
+                groups.add(QuestionShuffleGroup(groupList, null))
+                i = j
+            }
+        }
+
+        if (groups.size < 2) continue
+
+        var shuffledGroups = groups.shuffled()
+        if (shuffledGroups == groups && groups.size > 1) {
+            shuffledGroups = groups.drop(1) + groups.first()
+        }
+
+        var slotCursor = 0
+        for (group in shuffledGroups) {
+            val groupStartSlotId = targetSlotIds[slotCursor]
+            val groupEndSlotId = targetSlotIds[slotCursor + group.questions.size - 1]
+            val updatedHeaderJson = if (group.headerText != null && group.questions.size > 1) {
+                gson.toJson(
+                    com.example.data.QBookHeader(
+                        startId = groupStartSlotId,
+                        endId = groupEndSlotId,
+                        text = group.headerText
+                    )
+                )
+            } else null
+
+            for (oldQ in group.questions) {
+                val newSlotIndex = indicesInTopic[slotCursor]
+                val newId = targetSlotIds[slotCursor]
+                idMapping[oldQ.id] = newId
+                val newHeader = when {
+                    updatedHeaderJson != null -> updatedHeaderJson
+                    oldQ.questionHeader?.trim()?.startsWith("{") == true -> {
+                        try {
+                            val h = gson.fromJson(oldQ.questionHeader, com.example.data.QBookHeader::class.java)
+                            gson.toJson(h.copy(startId = newId, endId = newId))
+                        } catch (_: Exception) { oldQ.questionHeader }
+                    }
+                    else -> oldQ.questionHeader
+                }
+                updatedBySlot[newSlotIndex] = oldQ.copy(
+                    id = newId,
+                    globalId = "${oldQ.bookId}_${newId}",
+                    questionHeader = newHeader
+                )
+                slotCursor++
+                totalShuffledQuestions++
+            }
+        }
+    }
+
+    return Triple(updatedBySlot, idMapping, totalShuffledQuestions)
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ShuffleBookDialog(
+    questions: List<QuestionEntity>,
+    onDismiss: () -> Unit,
+    onShuffleOptions: (Long, Long) -> Unit,
+    onShuffleQuestionsInTopics: (Set<String>) -> Unit
+) {
+    val sortedQuestions = remember(questions) { questions.sortedBy { it.id } }
+    val minQId = remember(sortedQuestions) { sortedQuestions.firstOrNull()?.id ?: 1L }
+    val maxQId = remember(sortedQuestions) { sortedQuestions.lastOrNull()?.id ?: 1L }
+
+    // 0 = Shuffle Options, 1 = Shuffle Questions (within Topic)
+    var selectedTab by remember { mutableStateOf(0) }
+
+    // State for Tab 0: Shuffle Options (Question Range)
+    var startIdText by remember(minQId) { mutableStateOf(minQId.toString()) }
+    var endIdText by remember(maxQId) { mutableStateOf(maxQId.toString()) }
+
+    val parsedStart = startIdText.trim().toLongOrNull()
+    val parsedEnd = endIdText.trim().toLongOrNull()
+    val matchingOptionQuestionsCount = remember(sortedQuestions, parsedStart, parsedEnd) {
+        if (parsedStart == null || parsedEnd == null) 0
+        else {
+            val low = minOf(parsedStart, parsedEnd)
+            val high = maxOf(parsedStart, parsedEnd)
+            sortedQuestions.count { it.id in low..high }
+        }
+    }
+
+    // State for Tab 1: Shuffle Questions within Topic(s)
+    val topicEntries = remember(sortedQuestions) {
+        sortedQuestions
+            .groupBy { extractQuestionTopicLabel(it) }
+            .map { (topic, qs) -> topic to qs.size }
+    }
+    var selectedTopics by remember(topicEntries) {
+        mutableStateOf(
+            topicEntries.firstOrNull { it.second >= 2 }?.let { setOf(it.first) } ?: emptySet()
+        )
+    }
+
+    val totalQuestionsInSelectedTopics = remember(topicEntries, selectedTopics) {
+        topicEntries.filter { it.first in selectedTopics }.sumOf { it.second }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "Shuffle Book Content",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = if (selectedTab == 0) {
+                        "Randomize option order (A, B, C, D) while preserving correct answers"
+                    } else {
+                        "Randomize question sequence within selected topic(s)"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Mode Selector Tabs
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    SegmentedButton(
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
+                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                        label = { Text("Shuffle Options", maxLines = 1) }
+                    )
+                    SegmentedButton(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                        label = { Text("Shuffle Questions", maxLines = 1) }
+                    )
+                }
+
+                if (selectedTab == 0) {
+                    // Shuffle Options by Question Range
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Available range: Q$minQId – Q$maxQId",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            TextButton(
+                                onClick = {
+                                    startIdText = minQId.toString()
+                                    endIdText = maxQId.toString()
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text("Select All", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = startIdText,
+                            onValueChange = { startIdText = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("From Q#") },
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                            ),
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = endIdText,
+                            onValueChange = { endIdText = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("To Q#") },
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                            ),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Text(
+                        text = "$matchingOptionQuestionsCount question(s) selected in range",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (matchingOptionQuestionsCount > 0) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        }
+                    )
+                } else {
+                    // Shuffle Questions within Topic(s)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Select Topic(s) (${selectedTopics.size}/${topicEntries.size})",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            TextButton(
+                                onClick = {
+                                    selectedTopics = topicEntries
+                                        .filter { it.second >= 2 }
+                                        .map { it.first }
+                                        .toSet()
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text("All")
+                            }
+                            TextButton(
+                                onClick = { selectedTopics = emptySet() },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text("Clear")
+                            }
+                        }
+                    }
+
+                    if (topicEntries.isEmpty()) {
+                        Text(
+                            text = "No topics found in this book.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            topicEntries.forEach { (topicName, qCount) ->
+                                val isSelected = topicName in selectedTopics
+                                val canShuffle = qCount >= 2
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (isSelected) {
+                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainerLow
+                                    },
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        1.dp,
+                                        if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                                        else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable(enabled = canShuffle) {
+                                            selectedTopics = if (isSelected) {
+                                                selectedTopics - topicName
+                                            } else {
+                                                selectedTopics + topicName
+                                            }
+                                        }
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.weight(1f),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Checkbox(
+                                                checked = isSelected,
+                                                onCheckedChange = null,
+                                                enabled = canShuffle
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = topicName,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                                color = if (canShuffle) {
+                                                    MaterialTheme.colorScheme.onSurface
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                                }
+                                            )
+                                        }
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = MaterialTheme.colorScheme.surfaceContainerHighest
+                                        ) {
+                                            Text(
+                                                text = "$qCount Qs",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text(
+                        text = "$totalQuestionsInSelectedTopics question(s) in ${selectedTopics.size} topic(s) will be shuffled",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (totalQuestionsInSelectedTopics >= 2) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (selectedTab == 0) {
+                        if (parsedStart != null && parsedEnd != null && matchingOptionQuestionsCount > 0) {
+                            onShuffleOptions(parsedStart, parsedEnd)
+                        }
+                    } else {
+                        if (selectedTopics.isNotEmpty() && totalQuestionsInSelectedTopics >= 2) {
+                            onShuffleQuestionsInTopics(selectedTopics)
+                        }
+                    }
+                },
+                enabled = if (selectedTab == 0) {
+                    parsedStart != null && parsedEnd != null && matchingOptionQuestionsCount > 0
+                } else {
+                    selectedTopics.isNotEmpty() && totalQuestionsInSelectedTopics >= 2
+                }
+            ) {
+                Text(if (selectedTab == 0) "Shuffle Options" else "Shuffle Questions")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
