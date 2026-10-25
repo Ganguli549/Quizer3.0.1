@@ -305,14 +305,18 @@ fun AiAssistantBottomSheet(
         }
     }
 
-    LaunchedEffect(chatHistory.size, isHistoryLoadedInMemory) {
-        if (isHistoryLoadedInMemory && chatHistory.isNotEmpty()) {
-            val targetIndex = chatHistory.size - 1
-            if (chatHistory.size > previousChatSize) {
+    var wasProcessing by remember(chatContextId) { mutableStateOf(isProcessing) }
+    LaunchedEffect(chatHistory.size, isHistoryLoadedInMemory, isProcessing) {
+        if (isHistoryLoadedInMemory) {
+            if (chatHistory.isNotEmpty() && chatHistory.size > previousChatSize) {
+                val targetIndex = if (isProcessing && pendingUpdates == null) chatHistory.size else chatHistory.size - 1
                 listState.animateScrollToItem(targetIndex)
+            } else if (isProcessing && !wasProcessing && pendingUpdates == null) {
+                listState.animateScrollToItem(chatHistory.size)
             }
         }
         previousChatSize = chatHistory.size
+        wasProcessing = isProcessing
     }
 
     var hasAutoSent by remember { mutableStateOf(!autoSend) }
@@ -404,35 +408,6 @@ fun AiAssistantBottomSheet(
         onDismiss()
     }
     
-    val sheetDensity = androidx.compose.ui.platform.LocalDensity.current
-    val sheetScreenHeightDp = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
-    val rootInsets = androidx.core.view.ViewCompat.getRootWindowInsets(currentView)
-    val statusBarDp = maxOf(
-        with(sheetDensity) {
-            (rootInsets?.getInsetsIgnoringVisibility(
-                androidx.core.view.WindowInsetsCompat.Type.statusBars() or
-                    androidx.core.view.WindowInsetsCompat.Type.displayCutout()
-            )?.top ?: 0).toDp()
-        },
-        androidx.compose.foundation.layout.WindowInsets.statusBars.asPaddingValues().calculateTopPadding(),
-        28.dp
-    )
-    val imeBottomDp = maxOf(
-        with(sheetDensity) {
-            (rootInsets?.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())?.bottom ?: 0).toDp()
-        },
-        androidx.compose.foundation.layout.WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-    )
-    val navBottomDp = maxOf(
-        with(sheetDensity) {
-            (rootInsets?.getInsetsIgnoringVisibility(androidx.core.view.WindowInsetsCompat.Type.navigationBars())?.bottom ?: 0).toDp()
-        },
-        androidx.compose.foundation.layout.WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-    )
-    val fullWindowHeightDp = with(sheetDensity) {
-        currentView.rootView.height.takeIf { it > 0 }?.toDp()
-    } ?: (sheetScreenHeightDp + statusBarDp + navBottomDp)
-
     CustomModalBottomSheet(
         sheetState = sheetState,
         maxHeightFraction = 0.90f,
@@ -440,11 +415,14 @@ fun AiAssistantBottomSheet(
         enableDynamicHeight = true,
         onDismissRequest = handleNativeDismiss
     ) {
-        val sheetTargetHeightDp = LocalSheetTargetHeightDp.current
-        val sheetMinHeightDp = LocalSheetMinHeightDp.current
-        val isSheetFixedHeight = LocalSheetIsFixedHeight.current
-        val minSheetHeightPx = with(sheetDensity) { sheetMinHeightDp.roundToPx() }
-        val targetSheetHeightPx = with(sheetDensity) { sheetTargetHeightDp.roundToPx() }
+        val sheetHeightBounds = LocalSheetHeightBounds.current
+        val chatScrollTracker = remember(chatContextId, isHistoryLoadedInMemory) {
+            object {
+                var lastChatH: Int = -1
+                var peakContentHeightPx: Int = 0
+                var lastHistoryKey: Int = 0
+            }
+        }
 
         androidx.compose.ui.layout.Layout(
             modifier = Modifier.fillMaxWidth(),
@@ -1384,6 +1362,12 @@ fun AiAssistantBottomSheet(
                 }
             }
         ) { measurables, constraints ->
+            val targetSheetHeightPx = sheetHeightBounds.targetHeightPx
+                .takeIf { it > 0 } ?: constraints.maxHeight
+            val minSheetHeightPx = sheetHeightBounds.minHeightPx
+                .takeIf { it > 0 } ?: constraints.minHeight
+            val isSheetFixedHeight = sheetHeightBounds.isFixedHeight
+
             val maxSheetH = minOf(constraints.maxHeight, targetSheetHeightPx).coerceAtLeast(0)
             val minSheetH = if (isSheetFixedHeight) {
                 maxSheetH
@@ -1403,16 +1387,118 @@ fun AiAssistantBottomSheet(
             val bottomH = bottomPlaceable.height
 
             val maxChatH = (maxSheetH - headerH - bottomH).coerceAtLeast(0)
-            val minChatH = if (isSheetFixedHeight) {
+            val baseMinChatH = if (isSheetFixedHeight) {
                 maxChatH
             } else {
                 (minSheetH - headerH - bottomH).coerceAtLeast(0).coerceAtMost(maxChatH)
             }
 
+            val bottomSnapThresholdPx = 24.dp.roundToPx()
+            var effectiveMinChatH = baseMinChatH
+
+            if (!showDevLogs) {
+                androidx.compose.runtime.snapshots.Snapshot.withoutReadObservation {
+                    val historyKey = chatHistory.size * 31 +
+                        (chatHistory.lastOrNull()?.content?.length ?: 0) +
+                        (if (isProcessing) 1 else 0)
+                    if (historyKey != chatScrollTracker.lastHistoryKey) {
+                        if (chatHistory.isEmpty() && !isProcessing) {
+                            chatScrollTracker.peakContentHeightPx = 0
+                        }
+                        chatScrollTracker.lastHistoryKey = historyKey
+                    }
+
+                    val layoutInfo = listState.layoutInfo
+                    val visibleItems = layoutInfo.visibleItemsInfo
+                    val totalItems = layoutInfo.totalItemsCount
+                    val prevViewportH = layoutInfo.viewportSize.height
+                    val prevChatH = if (chatScrollTracker.lastChatH >= 0) {
+                        chatScrollTracker.lastChatH
+                    } else {
+                        prevViewportH
+                    }
+
+                    if (totalItems > 0 && visibleItems.isNotEmpty()) {
+                        val firstVis = visibleItems.first()
+                        val lastVis = visibleItems.last()
+                        val distanceFromBottomPx = if (lastVis.index == totalItems - 1) {
+                            (lastVis.offset + lastVis.size) - layoutInfo.viewportEndOffset
+                        } else {
+                            Int.MAX_VALUE
+                        }
+                        val currentlyAtBottom =
+                            !listState.canScrollForward || distanceFromBottomPx <= bottomSnapThresholdPx
+
+                        val visibleSpanH = (lastVis.offset - firstVis.offset) + lastVis.size +
+                            layoutInfo.beforeContentPadding + layoutInfo.afterContentPadding
+                        if (listState.canScrollForward || firstVis.index > 0) {
+                            chatScrollTracker.peakContentHeightPx = maxOf(
+                                chatScrollTracker.peakContentHeightPx,
+                                visibleSpanH,
+                                prevChatH
+                            )
+                        } else {
+                            chatScrollTracker.peakContentHeightPx = visibleSpanH
+                        }
+
+                        // When the chat is at the very bottom and the viewport height shrinks
+                        // (e.g., keyboard opens or bottom bar grows), shift the scroll offset
+                        // synchronously before measuring LazyColumn so the bottom of the chat
+                        // scrolls upward in lockstep with the rising input box (matching ChatGPT).
+                        // When scrolled up into the middle of the chat (!currentlyAtBottom),
+                        // do not adjust scroll so the visible messages stay anchored in place.
+                        if (currentlyAtBottom && !listState.isScrollInProgress && maxChatH < prevChatH) {
+                            val newViewportEndOffset = maxChatH - layoutInfo.afterContentPadding
+                            val neededShiftPx = if (lastVis.index == totalItems - 1) {
+                                (lastVis.offset + lastVis.size) - newViewportEndOffset
+                            } else {
+                                prevChatH - maxChatH
+                            }
+                            if (neededShiftPx > 0) {
+                                val targetItem = visibleItems.lastOrNull { it.offset <= neededShiftPx } ?: firstVis
+                                val newIndex = targetItem.index
+                                val newScrollOffset = (neededShiftPx - targetItem.offset).coerceAtLeast(0)
+                                listState.requestScrollToItem(newIndex, newScrollOffset)
+                            }
+                        }
+                    } else if (chatHistory.isEmpty() && !isProcessing) {
+                        chatScrollTracker.peakContentHeightPx = 0
+                    }
+
+                    effectiveMinChatH = maxOf(
+                        baseMinChatH,
+                        minOf(chatScrollTracker.peakContentHeightPx, maxChatH)
+                    )
+                }
+            }
+
             val chatPlaceable = measurables[1].measure(
-                constraints.copy(minHeight = minChatH, maxHeight = maxChatH)
+                constraints.copy(minHeight = effectiveMinChatH, maxHeight = maxChatH)
             )
             val chatH = chatPlaceable.height
+
+            if (!showDevLogs) {
+                androidx.compose.runtime.snapshots.Snapshot.withoutReadObservation {
+                    val postInfo = listState.layoutInfo
+                    val postVis = postInfo.visibleItemsInfo
+                    if (postInfo.totalItemsCount > 0 && postVis.isNotEmpty()) {
+                        val firstVis = postVis.first()
+                        val lastVis = postVis.last()
+                        val spanH = (lastVis.offset - firstVis.offset) + lastVis.size +
+                            postInfo.beforeContentPadding + postInfo.afterContentPadding
+                        if (listState.canScrollForward || firstVis.index > 0) {
+                            chatScrollTracker.peakContentHeightPx = maxOf(
+                                chatScrollTracker.peakContentHeightPx,
+                                spanH,
+                                chatH
+                            )
+                        } else {
+                            chatScrollTracker.peakContentHeightPx = spanH
+                        }
+                    }
+                    chatScrollTracker.lastChatH = chatH
+                }
+            }
 
             val totalH = (headerH + chatH + bottomH).coerceIn(minSheetH, maxSheetH)
 

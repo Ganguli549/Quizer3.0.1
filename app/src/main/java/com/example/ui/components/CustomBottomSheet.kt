@@ -24,8 +24,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -36,9 +36,19 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
-val LocalSheetTargetHeightDp = compositionLocalOf { 0.dp }
-val LocalSheetMinHeightDp = compositionLocalOf { 0.dp }
-val LocalSheetIsFixedHeight = compositionLocalOf { false }
+class SheetHeightBounds {
+    var minHeightPx: Int = 0
+    var targetHeightPx: Int = 0
+    var isFixedHeight: Boolean = false
+}
+
+val LocalSheetHeightBounds = staticCompositionLocalOf { SheetHeightBounds() }
+
+private class SheetLayoutMetrics {
+    var measuredSheetHeightPx: Int = 0
+    var latestChromeAndInsetPx: Float = 0f
+    var isImeCurrentlyVisible: Boolean = false
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -67,20 +77,15 @@ fun CustomModalBottomSheet(
     val rootNavBarPx = rootWindowInsets
         ?.getInsetsIgnoringVisibility(androidx.core.view.WindowInsetsCompat.Type.navigationBars())
         ?.bottom ?: 0
-    val rootImePx = rootWindowInsets
-        ?.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())
-        ?.bottom ?: 0
 
     val composeStatusBarPx = WindowInsets.statusBars.getTop(density)
     val composeNavBarPx = WindowInsets.navigationBars.getBottom(density)
-    val composeImePx = WindowInsets.ime.getBottom(density)
 
     val statusBarHeightDp = maxOf(
         with(density) { maxOf(rootStatusBarPx, composeStatusBarPx).toDp() },
         28.dp
     )
     val navBarHeightDp = with(density) { maxOf(rootNavBarPx, composeNavBarPx).toDp() }
-    val imeHeightDp = with(density) { maxOf(rootImePx, composeImePx).toDp() }
 
     val screenHeightDp = configuration.screenHeightDp.dp
     val fullWindowHeightDp = with(density) {
@@ -89,7 +94,7 @@ fun CustomModalBottomSheet(
     val screenHeightPx = with(density) { fullWindowHeightDp.toPx().coerceAtLeast(1f) }
 
     val defaultExpandedFraction = maxHeightFraction.coerceIn(0.50f, 0.94f)
-    val fullExpandedFraction = maxOf(defaultExpandedFraction, 0.92f)
+    val fullExpandedFraction = defaultExpandedFraction
     // Exact 50% middle screen height snap point
     val halfExpandedFraction = 0.50f
     val dismissThresholdFraction = 0.28f
@@ -108,9 +113,8 @@ fun CustomModalBottomSheet(
 
     var handleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     var contentCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
-    var measuredSheetHeightPx by remember { mutableIntStateOf(0) }
-    var latestChromeAndInsetPx by remember { mutableFloatStateOf(0f) }
-    var isImeCurrentlyVisible by remember { mutableStateOf(false) }
+    val metrics = remember { SheetLayoutMetrics() }
+    val heightBounds = remember { SheetHeightBounds() }
 
     // NestedScrollConnection that swallows any unconsumed vertical scroll/fling inside the sheet content
     // so scrolling upwards or downwards inside LazyColumn / verticalScroll / RichText NEVER drags or closes the sheet.
@@ -180,10 +184,10 @@ fun CustomModalBottomSheet(
     }
 
     fun resolveEffectiveStartFraction(): Float {
-        if (measuredSheetHeightPx <= 0) {
+        if (metrics.measuredSheetHeightPx <= 0) {
             return userLockedFraction ?: sheetFractionAnim.value
         }
-        val totalVisiblePx = measuredSheetHeightPx.toFloat() + latestChromeAndInsetPx
+        val totalVisiblePx = metrics.measuredSheetHeightPx.toFloat() + metrics.latestChromeAndInsetPx
         val actualVisibleFraction = (totalVisiblePx / screenHeightPx)
             .coerceIn(0.14f, fullExpandedFraction)
         return if (userLockedFraction != null || fillMaxSheetHeight) {
@@ -303,7 +307,7 @@ fun CustomModalBottomSheet(
                                         dragStarted = true
                                         dragFraction = startFraction
                                         isDraggingHandle = true
-                                        if (isImeCurrentlyVisible) {
+                                        if (metrics.isImeCurrentlyVisible) {
                                             safeHideKeyboard()
                                         }
                                     }
@@ -344,7 +348,7 @@ fun CustomModalBottomSheet(
                                     } else {
                                         halfExpandedFraction
                                     }
-                                    if (isImeCurrentlyVisible && nextTarget <= halfExpandedFraction + 0.05f) {
+                                    if (metrics.isImeCurrentlyVisible && nextTarget <= halfExpandedFraction + 0.05f) {
                                         safeHideKeyboard()
                                     }
                                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -399,85 +403,87 @@ fun CustomModalBottomSheet(
                     androidx.core.view.WindowInsetsCompat.Type.navigationBars()
                 )?.bottom ?: 0).toDp()
             }
-            val dialogImeDp = with(density) {
-                (dialogInsets?.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())?.bottom ?: 0).toDp()
-            }
 
             val effectiveStatusBarDp = maxOf(statusBarHeightDp, dialogStatusBarDp, 28.dp)
-            val effectiveNavBarDp = maxOf(
-                navBarHeightDp,
-                dialogNavBarDp,
-                WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-            )
-            val composeAnimatedImeDp = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-            val effectiveImeDp = if (composeAnimatedImeDp > 0.dp) {
-                composeAnimatedImeDp
-            } else {
-                maxOf(imeHeightDp, dialogImeDp)
-            }
-            val effectiveBottomInsetDp = maxOf(effectiveNavBarDp, effectiveImeDp)
-            val unconsumedNavBarDp = (effectiveNavBarDp - effectiveImeDp).coerceAtLeast(0.dp)
-
-            val minTopClearanceFromScreenTopDp = maxOf(
-                effectiveStatusBarDp + 18.dp,
-                fullWindowHeightDp * (1f - fullExpandedFraction)
-            )
-            val dragHandleHeightDp = 14.dp
-
-            SideEffect {
-                isImeCurrentlyVisible = effectiveImeDp > effectiveNavBarDp + 20.dp
-                latestChromeAndInsetPx = with(density) {
-                    (unconsumedNavBarDp + dragHandleHeightDp).toPx()
-                }
-            }
-
-            val maxAllowedColumnHeightDp = (
-                fullWindowHeightDp - minTopClearanceFromScreenTopDp - effectiveBottomInsetDp - dragHandleHeightDp
-            ).coerceAtLeast(140.dp)
-
-            val activeFraction = if (isDraggingHandle) {
-                dragFraction
-            } else {
-                sheetFractionAnim.value
-            }
-
-            // Do not subtract IME height from desiredColumnHeightDp or halfColumnHeightDp:
-            // ModalBottomSheet already shifts the sheet upward by WindowInsets.ime, so preserving
-            // the column height (capped by maxAllowedColumnHeightDp) makes the mid-height (50%) sheet
-            // shift upward smoothly with the keyboard instead of collapsing its inner content.
-            val desiredColumnHeightDp = (
-                (fullWindowHeightDp * activeFraction) - unconsumedNavBarDp - dragHandleHeightDp
-            ).coerceAtLeast(120.dp)
-
-            val halfColumnHeightDp = minOf(
-                ((fullWindowHeightDp * halfExpandedFraction) - unconsumedNavBarDp - dragHandleHeightDp).coerceAtLeast(140.dp),
-                maxAllowedColumnHeightDp
-            )
-
-            val targetHeight: Dp = minOf(desiredColumnHeightDp, maxAllowedColumnHeightDp)
-            val isFixedSheetHeight = fillMaxSheetHeight || isDraggingHandle || (userLockedFraction != null)
+            val baseNavBarDp = maxOf(navBarHeightDp, dialogNavBarDp)
             val headerDragZonePx = with(density) { 44.dp.toPx() }
+            val imeInsets = WindowInsets.ime
+            val navBarInsets = WindowInsets.navigationBars
 
             CompositionLocalProvider(
-                LocalSheetTargetHeightDp provides targetHeight,
-                LocalSheetMinHeightDp provides minOf(halfColumnHeightDp, targetHeight),
-                LocalSheetIsFixedHeight provides isFixedSheetHeight
+                LocalSheetHeightBounds provides heightBounds
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .then(
-                            if (isFixedSheetHeight) {
-                                Modifier.height(targetHeight)
+                        .layout { measurable, constraints ->
+                            val effectiveStatusBarPx = effectiveStatusBarDp.roundToPx()
+                            val effectiveNavBarPx = maxOf(
+                                baseNavBarDp.roundToPx(),
+                                navBarInsets.getBottom(this)
+                            )
+                            // Read animated IME inset directly in the Layout phase so it is 100%
+                            // synchronized frame-for-frame with ModalBottomSheet's contentWindowInsets
+                            // without triggering Composition-phase recompositions or Frame-0 jumps.
+                            val effectiveImePx = imeInsets.getBottom(this)
+                            val effectiveBottomInsetPx = maxOf(effectiveNavBarPx, effectiveImePx)
+                            val unconsumedNavBarPx = (effectiveNavBarPx - effectiveImePx).coerceAtLeast(0)
+                            val dragHandleHeightPx = 14.dp.roundToPx()
+
+                            val activeFraction = if (isDraggingHandle) {
+                                dragFraction
                             } else {
-                                Modifier.heightIn(
-                                    min = minOf(halfColumnHeightDp, targetHeight),
-                                    max = targetHeight
-                                )
+                                sheetFractionAnim.value
                             }
-                        )
+
+                            val maxTopFraction = maxOf(activeFraction, defaultExpandedFraction)
+                            val minTopClearancePx = maxOf(
+                                effectiveStatusBarPx + 18.dp.roundToPx(),
+                                (screenHeightPx * (1f - maxTopFraction)).toInt()
+                            )
+
+                            val maxAllowedColumnHeightPx = (
+                                screenHeightPx.toInt() - minTopClearancePx - effectiveBottomInsetPx - dragHandleHeightPx
+                            ).coerceAtLeast(140.dp.roundToPx())
+
+                            val desiredColumnHeightPx = (
+                                (screenHeightPx * activeFraction).toInt() - effectiveNavBarPx - dragHandleHeightPx
+                            ).coerceAtLeast(120.dp.roundToPx())
+
+                            val halfColumnHeightPx = minOf(
+                                ((screenHeightPx * halfExpandedFraction).toInt() - effectiveNavBarPx - dragHandleHeightPx)
+                                    .coerceAtLeast(140.dp.roundToPx()),
+                                maxAllowedColumnHeightPx
+                            )
+
+                            val targetHeightPx = minOf(desiredColumnHeightPx, maxAllowedColumnHeightPx)
+                            val isFixedSheetHeight = fillMaxSheetHeight || isDraggingHandle || (userLockedFraction != null)
+                            val minHeightPx = if (isFixedSheetHeight) {
+                                targetHeightPx
+                            } else {
+                                minOf(halfColumnHeightPx, targetHeightPx)
+                            }
+
+                            heightBounds.minHeightPx = minHeightPx
+                            heightBounds.targetHeightPx = targetHeightPx
+                            heightBounds.isFixedHeight = isFixedSheetHeight
+
+                            val placeable = measurable.measure(
+                                constraints.copy(
+                                    minHeight = minHeightPx.coerceAtMost(constraints.maxHeight),
+                                    maxHeight = targetHeightPx.coerceAtMost(constraints.maxHeight)
+                                )
+                            )
+
+                            metrics.measuredSheetHeightPx = placeable.height
+                            metrics.isImeCurrentlyVisible = effectiveImePx > effectiveNavBarPx + 20.dp.roundToPx()
+                            metrics.latestChromeAndInsetPx = (unconsumedNavBarPx + dragHandleHeightPx).toFloat()
+
+                            layout(placeable.width, placeable.height) {
+                                placeable.placeRelative(0, 0)
+                            }
+                        }
                         .onGloballyPositioned { contentCoords = it }
-                        .onSizeChanged { measuredSheetHeightPx = it.height }
                         // Allow dragging the sheet from the top 44.dp title/header bar right below the pill
                         // without interfering with taps on header buttons (menu, close, tabs).
                         .pointerInput(enableDynamicHeight, defaultExpandedFraction, screenHeightPx) {
@@ -518,7 +524,7 @@ fun CustomModalBottomSheet(
                                                 dragStarted = true
                                                 dragFraction = startFraction
                                                 isDraggingHandle = true
-                                                if (isImeCurrentlyVisible) {
+                                                if (metrics.isImeCurrentlyVisible) {
                                                     safeHideKeyboard()
                                                 }
                                             } else if (abs(totalDeltaX) > touchSlopPx) {
